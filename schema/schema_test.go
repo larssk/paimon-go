@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/apache/paimon/paimon-go/schema"
+	"github.com/larssk/paimon-go/schema"
 )
 
 func TestDataType_SimpleString_Nullable(t *testing.T) {

@@ -10,10 +10,10 @@ import (
 	"github.com/hamba/avro/v2"
 	"github.com/hamba/avro/v2/ocf"
 
-	"github.com/apache/paimon/paimon-go/fileio"
-	"github.com/apache/paimon/paimon-go/internal/binaryrow"
-	"github.com/apache/paimon/paimon-go/internal/pathutil"
-	"github.com/apache/paimon/paimon-go/schema"
+	"github.com/larssk/paimon-go/fileio"
+	"github.com/larssk/paimon-go/internal/binaryrow"
+	"github.com/larssk/paimon-go/internal/pathutil"
+	"github.com/larssk/paimon-go/schema"
 )
 
 // SimpleStats holds the min/max/null statistics for a set of fields.

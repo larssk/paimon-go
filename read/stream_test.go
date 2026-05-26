@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/apache/paimon/paimon-go/manifest"
-	"github.com/apache/paimon/paimon-go/schema"
-	"github.com/apache/paimon/paimon-go/snapshot"
+	"github.com/larssk/paimon-go/manifest"
+	"github.com/larssk/paimon-go/schema"
+	"github.com/larssk/paimon-go/snapshot"
 )
 
 // ---------------------------------------------------------------------------

@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/apache/paimon/paimon-go/manifest"
-	"github.com/apache/paimon/paimon-go/predicate"
-	"github.com/apache/paimon/paimon-go/schema"
-	"github.com/apache/paimon/paimon-go/table"
+	"github.com/larssk/paimon-go/manifest"
+	"github.com/larssk/paimon-go/predicate"
+	"github.com/larssk/paimon-go/schema"
+	"github.com/larssk/paimon-go/table"
 )
 
 // DataSplit represents a unit of work: a set of data files from one bucket/partition

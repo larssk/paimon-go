@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/apache/paimon/paimon-go/schema"
+	"github.com/larssk/paimon-go/schema"
 )
 
 // Compare compares two BinaryRows field-by-field using the provided key fields

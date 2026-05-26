@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/apache/paimon/paimon-go/fileio"
-	"github.com/apache/paimon/paimon-go/internal/pathutil"
-	"github.com/apache/paimon/paimon-go/table"
+	"github.com/larssk/paimon-go/fileio"
+	"github.com/larssk/paimon-go/internal/pathutil"
+	"github.com/larssk/paimon-go/table"
 )
 
 // Catalog is the interface for accessing Paimon tables.

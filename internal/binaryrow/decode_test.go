@@ -5,7 +5,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/apache/paimon/paimon-go/internal/binaryrow"
+	"github.com/larssk/paimon-go/internal/binaryrow"
 )
 
 // buildRow builds a synthetic BinaryRow byte slice matching Paimon's wire format.

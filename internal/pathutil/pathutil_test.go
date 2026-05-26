@@ -3,7 +3,7 @@ package pathutil_test
 import (
 	"testing"
 
-	"github.com/apache/paimon/paimon-go/internal/pathutil"
+	"github.com/larssk/paimon-go/internal/pathutil"
 )
 
 func TestJoin_Local(t *testing.T) {

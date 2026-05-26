@@ -3,8 +3,8 @@ package predicate_test
 import (
 	"fmt"
 
-	"github.com/apache/paimon/paimon-go/predicate"
-	"github.com/apache/paimon/paimon-go/schema"
+	"github.com/larssk/paimon-go/predicate"
+	"github.com/larssk/paimon-go/schema"
 )
 
 // fields is a small schema used across examples.

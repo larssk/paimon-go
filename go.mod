@@ -1,4 +1,4 @@
-module github.com/apache/paimon/paimon-go
+module github.com/larssk/paimon-go
 
 go 1.25.0
 

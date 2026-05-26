@@ -7,8 +7,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
-	"github.com/apache/paimon/paimon-go/predicate"
-	"github.com/apache/paimon/paimon-go/schema"
+	"github.com/larssk/paimon-go/predicate"
+	"github.com/larssk/paimon-go/schema"
 )
 
 // ---------------------------------------------------------------------------

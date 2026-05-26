@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/apache/paimon/paimon-go/fileio"
-	"github.com/apache/paimon/paimon-go/internal/pathutil"
+	"github.com/larssk/paimon-go/fileio"
+	"github.com/larssk/paimon-go/internal/pathutil"
 )
 
 // CommitKind matches Paimon's CommitKind enum and describes what kind of

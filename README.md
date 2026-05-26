@@ -213,7 +213,7 @@ Prioritised next steps, roughly in order:
 ## Quick start
 
 ```sh
-go get github.com/apache/paimon/paimon-go
+go get github.com/larssk/paimon-go
 ```
 
 ```go

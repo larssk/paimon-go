@@ -9,8 +9,8 @@
 // Read all rows from a local table as Arrow record batches:
 //
 //	import (
-//	    "github.com/apache/paimon/paimon-go"
-//	    "github.com/apache/paimon/paimon-go/read"
+//	    "github.com/larssk/paimon-go"
+//	    "github.com/larssk/paimon-go/read"
 //	)
 //
 //	cat, err := paimon.NewCatalog(ctx, paimon.Options{Warehouse: "/data/warehouse"})
@@ -51,7 +51,7 @@
 //
 // Combine multiple conditions with And / Or / Not:
 //
-//	import "github.com/apache/paimon/paimon-go/predicate"
+//	import "github.com/larssk/paimon-go/predicate"
 //
 //	gt, _  := pb.GreaterThan("amount", float64(100))
 //	eq, _  := pb.Equal("status", "PAID")
@@ -110,8 +110,8 @@ package paimon
 import (
 	"context"
 
-	"github.com/apache/paimon/paimon-go/catalog"
-	"github.com/apache/paimon/paimon-go/fileio"
+	"github.com/larssk/paimon-go/catalog"
+	"github.com/larssk/paimon-go/fileio"
 )
 
 // Options configures a Paimon catalog.

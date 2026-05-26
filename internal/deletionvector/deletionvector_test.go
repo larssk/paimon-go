@@ -6,7 +6,7 @@ import (
 
 	"github.com/RoaringBitmap/roaring"
 
-	"github.com/apache/paimon/paimon-go/internal/deletionvector"
+	"github.com/larssk/paimon-go/internal/deletionvector"
 )
 
 // buildRecord serialises a roaring bitmap into a valid DV record byte slice.

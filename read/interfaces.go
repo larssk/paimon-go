@@ -3,11 +3,11 @@ package read
 import (
 	"context"
 
-	"github.com/apache/paimon/paimon-go/fileio"
-	"github.com/apache/paimon/paimon-go/internal/binaryrow"
-	"github.com/apache/paimon/paimon-go/manifest"
-	"github.com/apache/paimon/paimon-go/schema"
-	"github.com/apache/paimon/paimon-go/snapshot"
+	"github.com/larssk/paimon-go/fileio"
+	"github.com/larssk/paimon-go/internal/binaryrow"
+	"github.com/larssk/paimon-go/manifest"
+	"github.com/larssk/paimon-go/schema"
+	"github.com/larssk/paimon-go/snapshot"
 )
 
 // tableReader is the internal interface that ReadBuilder and TableScan depend on.

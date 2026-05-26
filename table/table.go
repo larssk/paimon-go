@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/apache/paimon/paimon-go/fileio"
-	"github.com/apache/paimon/paimon-go/internal/binaryrow"
-	"github.com/apache/paimon/paimon-go/internal/pathutil"
-	"github.com/apache/paimon/paimon-go/schema"
-	"github.com/apache/paimon/paimon-go/snapshot"
+	"github.com/larssk/paimon-go/fileio"
+	"github.com/larssk/paimon-go/internal/binaryrow"
+	"github.com/larssk/paimon-go/internal/pathutil"
+	"github.com/larssk/paimon-go/schema"
+	"github.com/larssk/paimon-go/snapshot"
 )
 
 const defaultPartValue = "__DEFAULT_PARTITION__"

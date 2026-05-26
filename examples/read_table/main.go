@@ -15,10 +15,10 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 
-	"github.com/apache/paimon/paimon-go"
-	"github.com/apache/paimon/paimon-go/predicate"
-	"github.com/apache/paimon/paimon-go/read"
-	"github.com/apache/paimon/paimon-go/table"
+	"github.com/larssk/paimon-go"
+	"github.com/larssk/paimon-go/predicate"
+	"github.com/larssk/paimon-go/read"
+	"github.com/larssk/paimon-go/table"
 )
 
 func main() {

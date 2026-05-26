@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/apache/paimon/paimon-go/schema"
+	"github.com/larssk/paimon-go/schema"
 )
 
 // makeIntRow builds a BinaryRow with a single INT32 field.

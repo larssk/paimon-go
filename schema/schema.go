@@ -10,8 +10,8 @@ import (
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/paimon/paimon-go/fileio"
-	"github.com/apache/paimon/paimon-go/internal/pathutil"
+	"github.com/larssk/paimon-go/fileio"
+	"github.com/larssk/paimon-go/internal/pathutil"
 )
 
 // DataType represents a Paimon field type.

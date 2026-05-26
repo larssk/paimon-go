@@ -22,9 +22,9 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
-	paimon "github.com/apache/paimon/paimon-go"
-	"github.com/apache/paimon/paimon-go/predicate"
-	"github.com/apache/paimon/paimon-go/read"
+	paimon "github.com/larssk/paimon-go"
+	"github.com/larssk/paimon-go/predicate"
+	"github.com/larssk/paimon-go/read"
 )
 
 // fixtureWarehouse returns the absolute path to the committed fixture warehouse.
