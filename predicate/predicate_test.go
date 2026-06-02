@@ -2,6 +2,7 @@ package predicate_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -208,5 +209,154 @@ func TestEvalRow_Or(t *testing.T) {
 	defer rec.Release()
 	if predicate.EvalRow(p, rec, 0) {
 		t.Error("EvalRow OR: expected false for id=3")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Timestamp Tests
+// ---------------------------------------------------------------------------
+
+// timestampSchema returns a schema with an INT32 "id" and a TIMESTAMP "ts".
+func timestampSchema() []schema.DataField {
+	return []schema.DataField{
+		{ID: 0, Name: "id", Type: schema.DataType{Type: "INT", Nullable: false}},
+		{ID: 1, Name: "ts", Type: schema.DataType{Type: "TIMESTAMP", Precision: 3, Nullable: true}},
+	}
+}
+
+// buildTimestampRecord builds a single-row RecordBatch with the given id (int32) and timestamp (milliseconds).
+func buildTimestampRecord(t *testing.T, id int32, tsMillis int64) arrow.RecordBatch {
+	t.Helper()
+	alloc := memory.NewGoAllocator()
+
+	idB := array.NewInt32Builder(alloc)
+	idB.Append(id)
+	idArr := idB.NewArray()
+	defer idArr.Release()
+
+	tsType := &arrow.TimestampType{Unit: arrow.Millisecond}
+	tsB := array.NewTimestampBuilder(alloc, tsType)
+	tsB.Append(arrow.Timestamp(tsMillis))
+	tsArr := tsB.NewArray()
+	defer tsArr.Release()
+
+	s := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+		{Name: "ts", Type: tsType, Nullable: true},
+	}, nil)
+	return array.NewRecord(s, []arrow.Array{idArr, tsArr}, 1)
+}
+
+// TestEvalRow_Timestamp_GreaterThan verifies that GreaterThan works with
+// TIMESTAMP fields when the predicate value is provided as int64 milliseconds.
+func TestEvalRow_Timestamp_GreaterThan(t *testing.T) {
+	fields := timestampSchema()
+	pb := predicate.NewBuilder(fields)
+
+	cutoff := int64(1000) // 1000ms = 1 second since epoch
+	p, err := pb.GreaterThan("ts", cutoff)
+	if err != nil {
+		t.Fatalf("build predicate: %v", err)
+	}
+
+	// Row with ts=2000ms should match (2000 > 1000)
+	rec := buildTimestampRecord(t, 1, 2000)
+	defer rec.Release()
+	if !predicate.EvalRow(p, rec, 0) {
+		t.Error("EvalRow: expected true for ts > 1000 with ts=2000")
+	}
+
+	// Row with ts=500ms should NOT match (500 > 1000 is false)
+	rec2 := buildTimestampRecord(t, 2, 500)
+	defer rec2.Release()
+	if predicate.EvalRow(p, rec2, 0) {
+		t.Error("EvalRow: expected false for ts > 1000 with ts=500")
+	}
+
+	// Row with ts=1000ms should NOT match (1000 > 1000 is false)
+	rec3 := buildTimestampRecord(t, 3, 1000)
+	defer rec3.Release()
+	if predicate.EvalRow(p, rec3, 0) {
+		t.Error("EvalRow: expected false for ts > 1000 with ts=1000")
+	}
+}
+
+// TestEvalRow_Timestamp_GreaterOrEqual verifies GreaterOrEqual with timestamps.
+func TestEvalRow_Timestamp_GreaterOrEqual(t *testing.T) {
+	fields := timestampSchema()
+	pb := predicate.NewBuilder(fields)
+
+	cutoff := int64(1000)
+	p, err := pb.GreaterOrEqual("ts", cutoff)
+	if err != nil {
+		t.Fatalf("build predicate: %v", err)
+	}
+
+	// Row with ts=1000ms should match (1000 >= 1000)
+	rec := buildTimestampRecord(t, 1, 1000)
+	defer rec.Release()
+	if !predicate.EvalRow(p, rec, 0) {
+		t.Error("EvalRow: expected true for ts >= 1000 with ts=1000")
+	}
+
+	// Row with ts=999ms should NOT match
+	rec2 := buildTimestampRecord(t, 2, 999)
+	defer rec2.Release()
+	if predicate.EvalRow(p, rec2, 0) {
+		t.Error("EvalRow: expected false for ts >= 1000 with ts=999")
+	}
+}
+
+// TestEvalRow_Timestamp_LessThan verifies LessThan with timestamps.
+func TestEvalRow_Timestamp_LessThan(t *testing.T) {
+	fields := timestampSchema()
+	pb := predicate.NewBuilder(fields)
+
+	cutoff := int64(1000)
+	p, err := pb.LessThan("ts", cutoff)
+	if err != nil {
+		t.Fatalf("build predicate: %v", err)
+	}
+
+	// Row with ts=500ms should match (500 < 1000)
+	rec := buildTimestampRecord(t, 1, 500)
+	defer rec.Release()
+	if !predicate.EvalRow(p, rec, 0) {
+		t.Error("EvalRow: expected true for ts < 1000 with ts=500")
+	}
+
+	// Row with ts=1000ms should NOT match
+	rec2 := buildTimestampRecord(t, 2, 1000)
+	defer rec2.Release()
+	if predicate.EvalRow(p, rec2, 0) {
+		t.Error("EvalRow: expected false for ts < 1000 with ts=1000")
+	}
+}
+
+// TestEvalRow_Timestamp_WithTimeValue verifies that predicates work when the
+// literal value is provided as time.Time (as would happen with stats from BinaryRow).
+func TestEvalRow_Timestamp_WithTimeValue(t *testing.T) {
+	fields := timestampSchema()
+	pb := predicate.NewBuilder(fields)
+
+	// Use time.Time as the predicate value (simulates stats comparison scenario)
+	cutoff := time.UnixMilli(1000).UTC()
+	p, err := pb.GreaterThan("ts", cutoff)
+	if err != nil {
+		t.Fatalf("build predicate: %v", err)
+	}
+
+	// Row with ts=2000ms should match
+	rec := buildTimestampRecord(t, 1, 2000)
+	defer rec.Release()
+	if !predicate.EvalRow(p, rec, 0) {
+		t.Error("EvalRow: expected true for ts > time.Time(1000ms) with ts=2000")
+	}
+
+	// Row with ts=500ms should NOT match
+	rec2 := buildTimestampRecord(t, 2, 500)
+	defer rec2.Release()
+	if predicate.EvalRow(p, rec2, 0) {
+		t.Error("EvalRow: expected false for ts > time.Time(1000ms) with ts=500")
 	}
 }

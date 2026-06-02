@@ -295,6 +295,99 @@ func TestPlan_PrunesEntriesByValueStats(t *testing.T) {
 	}
 }
 
+// timestampSchema returns a schema with an INT32 "id" and a TIMESTAMP "ts".
+func timestampSchema() *schema.TableSchema {
+	return &schema.TableSchema{
+		Fields: []schema.DataField{
+			{ID: 0, Name: "id", Type: schema.DataType{Type: "INT"}},
+			{ID: 1, Name: "ts", Type: schema.DataType{Type: "TIMESTAMP", Precision: 3}},
+		},
+	}
+}
+
+// buildTimestampStatsRow builds a BinaryRow with 2 fields: id (INT32) and ts (TIMESTAMP).
+// This matches timestampSchema() field order so FieldIdx in predicates aligns correctly.
+func buildTimestampStatsRow(id int32, tsMillis int64) *binaryrow.BinaryRow {
+	arity := 2
+	nullBitsSize := ((arity + 63 + 8) / 64) * 8 // 8 bytes
+	data := make([]byte, 4+nullBitsSize+arity*8)
+	binary.BigEndian.PutUint32(data[0:4], uint32(arity)) // arity prefix
+	// slot 0: INT32 stored little-endian in 8-byte slot
+	binary.LittleEndian.PutUint32(data[4+nullBitsSize:], uint32(id))
+	// slot 1: int64 stored little-endian in 8-byte slot (TIMESTAMP millis)
+	binary.LittleEndian.PutUint64(data[4+nullBitsSize+8:], uint64(tsMillis))
+	row, err := binaryrow.New(data)
+	if err != nil {
+		panic(err)
+	}
+	return row
+}
+
+// timestampStats builds a SimpleStats with min/max for both id and ts fields.
+func timestampStats(idLo, idHi int32, tsLoMillis, tsHiMillis int64) manifest.SimpleStats {
+	return manifest.SimpleStats{
+		MinValues: buildTimestampStatsRow(idLo, tsLoMillis),
+		MaxValues: buildTimestampStatsRow(idHi, tsHiMillis),
+	}
+}
+
+// TestPlan_PrunesEntriesByTimestampStats verifies that data-file entries are dropped
+// when a timestamp predicate (using int64 millis) can disprove a match from min/max
+// stats (which are decoded as time.Time from BinaryRow).
+// This test exercises the fix for timestamp comparison type mismatch.
+func TestPlan_PrunesEntriesByTimestampStats(t *testing.T) {
+	sch := timestampSchema()
+	tbl := &stubTable{snap: makeSnap(1), sch: sch}
+
+	// Cutoff: 1000ms. We want ts > 1000ms.
+	// Entry 1: ts in [500, 800] → max=800 < 1000, no rows can match → pruned
+	// Entry 2: ts in [900, 1500] → max=1500 > 1000, might have matches → kept
+	// Entry 3: ts in [100, 200] → max=200 < 1000, no rows can match → pruned
+	entries := []manifest.ManifestEntry{
+		{Kind: manifest.EntryAdd, Bucket: 0, File: manifest.DataFileMeta{
+			FileName: "too-old-1.parquet", RowCount: 100,
+			ValueStats: timestampStats(0, 0, 500, 800), // id doesn't matter, ts=[500,800]
+		}},
+		{Kind: manifest.EntryAdd, Bucket: 0, File: manifest.DataFileMeta{
+			FileName: "in-range.parquet", RowCount: 10,
+			ValueStats: timestampStats(0, 0, 900, 1500), // ts=[900,1500]
+		}},
+		{Kind: manifest.EntryAdd, Bucket: 0, File: manifest.DataFileMeta{
+			FileName: "too-old-2.parquet", RowCount: 50,
+			ValueStats: timestampStats(0, 0, 100, 200), // ts=[100,200]
+		}},
+	}
+	mr := &stubManifestReader{
+		listResults:   [][]manifest.ManifestFileMeta{{}, {}},
+		entriesResult: entries,
+	}
+
+	pb := predicate.NewBuilder(sch.Fields)
+	// User provides int64 millis as predicate value; BinaryRow decodes stats as time.Time.
+	// The fix ensures these are comparable.
+	p, err := pb.GreaterThan("ts", int64(1000))
+	if err != nil {
+		t.Fatalf("build predicate: %v", err)
+	}
+
+	rb := newReadBuilderFromIface(tbl, mr).WithFilter(p)
+	plan, err := rb.NewScan().Plan(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var totalFiles int
+	for _, s := range plan.Splits {
+		totalFiles += len(s.Files)
+	}
+	if totalFiles != 1 {
+		t.Errorf("want 1 file after timestamp pruning, got %d", totalFiles)
+	}
+	if totalFiles == 1 && plan.Splits[0].Files[0].FileName != "in-range.parquet" {
+		t.Errorf("want in-range.parquet to remain, got %s", plan.Splits[0].Files[0].FileName)
+	}
+}
+
 // TestPlan_SnapshotError verifies that an error from LatestSnapshot is propagated.
 func TestPlan_SnapshotError(t *testing.T) {
 	sentinel := errors.New("storage unavailable")

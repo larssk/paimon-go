@@ -8,6 +8,7 @@ package predicate
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -359,6 +360,15 @@ func compare(a, b interface{}) int {
 			return 1
 		}
 		return 0
+	case time.Time:
+		bv, _ := toComparableTime(b)
+		if av.Before(bv) {
+			return -1
+		}
+		if av.After(bv) {
+			return 1
+		}
+		return 0
 	}
 	return 0
 }
@@ -387,6 +397,8 @@ func toComparableInt(v interface{}) (int64, bool) {
 		return x, true
 	case float64:
 		return int64(x), true
+	case time.Time:
+		return x.UnixMilli(), true
 	}
 	return 0, false
 }
@@ -401,6 +413,18 @@ func toComparableFloat(v interface{}) (float64, bool) {
 		return float64(x), true
 	}
 	return 0, false
+}
+
+func toComparableTime(v interface{}) (time.Time, bool) {
+	switch x := v.(type) {
+	case time.Time:
+		return x, true
+	case int64:
+		return time.UnixMilli(x), true
+	case int:
+		return time.UnixMilli(int64(x)), true
+	}
+	return time.Time{}, false
 }
 
 // WithProjection rebinds predicate leaf FieldIdx values to match a projected field slice.
