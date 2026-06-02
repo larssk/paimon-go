@@ -114,6 +114,9 @@ func (m *multiSplitReader) Next() bool {
 }
 
 func (m *multiSplitReader) openSplit(split DataSplit) (array.RecordReader, error) {
+	// Rebase filter to projected schema indices.
+	rebasedFilter := predicate.WithProjection(m.tr.rb.filter, m.readFields)
+
 	if split.NeedsMerge {
 		s := m.tr.rb.tbl.GetSchema()
 		return newSortMergeReader(
@@ -124,7 +127,7 @@ func (m *multiSplitReader) openSplit(split DataSplit) (array.RecordReader, error
 			m.readFields,
 			m.arrowSchema,
 			m.alloc,
-			m.tr.rb.filter,
+			rebasedFilter,
 		)
 	}
 	// Append-only path: wrap in a single-split splitRecordReader.
@@ -135,6 +138,7 @@ func (m *multiSplitReader) openSplit(split DataSplit) (array.RecordReader, error
 		readFields:  m.readFields,
 		arrowSchema: m.arrowSchema,
 		alloc:       m.alloc,
+		filter:      rebasedFilter,
 	}, nil
 }
 
@@ -181,6 +185,7 @@ type splitRecordReader struct {
 	readFields  []schema.DataField
 	arrowSchema *arrow.Schema
 	alloc       memory.Allocator
+	filter      *predicate.Predicate // rebased to readFields indices
 
 	splitIdx int
 	fileIdx  int
@@ -244,8 +249,8 @@ func (r *splitRecordReader) Next() bool {
 				}
 
 				// Row-level filter: discard non-matching rows.
-				if r.tr.rb.filter != nil {
-					filtered := filterBatch(r.tr.rb.filter, projected, r.alloc)
+				if r.filter != nil {
+					filtered := filterBatch(r.filter, projected, r.alloc)
 					projected.Release()
 					if filtered == nil {
 						continue // all rows filtered out; advance to next batch

@@ -502,3 +502,147 @@ func buildDVRecord(t *testing.T, positions ...uint32) []byte {
 	// CRC left as zero (skipped on decode)
 	return buf
 }
+
+// ---------------------------------------------------------------------------
+// Filter + Projection rebasing tests
+// ---------------------------------------------------------------------------
+
+// fourColSchema returns a schema with 4 columns: id (INT), name (VARCHAR), value (BIGINT), status (VARCHAR).
+func fourColSchema() *schema.TableSchema {
+	return &schema.TableSchema{
+		Fields: []schema.DataField{
+			{ID: 0, Name: "id", Type: schema.DataType{Type: "INT", Nullable: true}},
+			{ID: 1, Name: "name", Type: schema.DataType{Type: "VARCHAR", Nullable: true}},
+			{ID: 2, Name: "value", Type: schema.DataType{Type: "BIGINT", Nullable: true}},
+			{ID: 3, Name: "status", Type: schema.DataType{Type: "VARCHAR", Nullable: true}},
+		},
+	}
+}
+
+// buildFourColTable builds a 4-column Arrow table with the given data.
+func buildFourColTable(t *testing.T, ids []int32, names []string, values []int64, statuses []string) arrow.Table {
+	t.Helper()
+	alloc := memory.NewGoAllocator()
+
+	idBldr := array.NewInt32Builder(alloc)
+	defer idBldr.Release()
+	idBldr.AppendValues(ids, nil)
+	idArr := idBldr.NewArray()
+	defer idArr.Release()
+
+	nameBldr := array.NewStringBuilder(alloc)
+	defer nameBldr.Release()
+	nameBldr.AppendValues(names, nil)
+	nameArr := nameBldr.NewArray()
+	defer nameArr.Release()
+
+	valBldr := array.NewInt64Builder(alloc)
+	defer valBldr.Release()
+	valBldr.AppendValues(values, nil)
+	valArr := valBldr.NewArray()
+	defer valArr.Release()
+
+	statusBldr := array.NewStringBuilder(alloc)
+	defer statusBldr.Release()
+	statusBldr.AppendValues(statuses, nil)
+	statusArr := statusBldr.NewArray()
+	defer statusArr.Release()
+
+	arrowSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "value", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "status", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+
+	return array.NewTableFromSlice(arrowSchema, [][]arrow.Array{{idArr}, {nameArr}, {valArr}, {statusArr}})
+}
+
+// TestToArrow_FilterRebasedWithProjection verifies that predicates are correctly
+// rebased to projected schema indices when WithProjection is used.
+//
+// Scenario:
+//   - Full schema: [id(0), name(1), value(2), status(3)]
+//   - Predicate: status == "active" (FieldIdx=3 in full schema)
+//   - Projection: [value, status] → projected schema: [value(0), status(1)]
+//
+// Without rebasing the filter, it would look up FieldIdx=3 in the projected record
+// which doesn't exist (only 2 columns), causing wrong results or panics.
+// With rebasing, FieldIdx is remapped to 1 (status's position in projected schema).
+func TestToArrow_FilterRebasedWithProjection(t *testing.T) {
+	// Build a Parquet file with 4 rows:
+	// Row 0: id=1, name="alice", value=100, status="active"
+	// Row 1: id=2, name="bob",   value=200, status="inactive"
+	// Row 2: id=3, name="carol", value=300, status="active"
+	// Row 3: id=4, name="dave",  value=400, status="pending"
+	arrowTbl := buildFourColTable(t,
+		[]int32{1, 2, 3, 4},
+		[]string{"alice", "bob", "carol", "dave"},
+		[]int64{100, 200, 300, 400},
+		[]string{"active", "inactive", "active", "pending"},
+	)
+	defer arrowTbl.Release()
+	parquetBytes := writeParquet(t, arrowTbl)
+
+	mio := newMockFileIO()
+	mio.register("data/four-col.parquet", parquetBytes)
+
+	sch := fourColSchema()
+	tbl := &readTable{sch: sch, io: mio}
+
+	// Build predicate on "status" which is at FieldIdx=3 in the full schema.
+	pb := predicate.NewBuilder(sch.Fields)
+	p, err := pb.Equal("status", "active")
+	if err != nil {
+		t.Fatalf("build predicate: %v", err)
+	}
+
+	// Project only [value, status]. In the projected schema:
+	// - value is at index 0
+	// - status is at index 1
+	// The filter must be rebased so it looks up index 1, not index 3.
+	rb := newReadBuilderFromIface(tbl, nil).
+		WithProjection([]string{"value", "status"}).
+		WithFilter(p)
+
+	result, err := rb.NewRead().ToArrow(context.Background(), []DataSplit{makeFileSplit("four-col.parquet")})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer result.Release()
+
+	// Should have 2 rows (id=1 and id=3 have status="active")
+	if result.NumRows() != 2 {
+		t.Fatalf("want 2 rows after filter (status=='active'), got %d", result.NumRows())
+	}
+
+	// Verify we only have 2 columns in the result (projection applied).
+	if result.NumCols() != 2 {
+		t.Fatalf("want 2 columns after projection, got %d", result.NumCols())
+	}
+
+	// Verify column names.
+	if result.Schema().Field(0).Name != "value" {
+		t.Errorf("want column 0 to be 'value', got %q", result.Schema().Field(0).Name)
+	}
+	if result.Schema().Field(1).Name != "status" {
+		t.Errorf("want column 1 to be 'status', got %q", result.Schema().Field(1).Name)
+	}
+
+	// Verify the surviving rows have value=100, value=300 (corresponding to status="active").
+	valChunk := result.Column(0).Data().Chunks()[0].(*array.Int64)
+	wantValues := []int64{100, 300}
+	for i, want := range wantValues {
+		if valChunk.Value(i) != want {
+			t.Errorf("row %d: want value=%d, got %d", i, want, valChunk.Value(i))
+		}
+	}
+
+	// Verify status column values are all "active".
+	statusChunk := result.Column(1).Data().Chunks()[0].(*array.String)
+	for i := 0; i < int(result.NumRows()); i++ {
+		if statusChunk.Value(i) != "active" {
+			t.Errorf("row %d: want status='active', got %q", i, statusChunk.Value(i))
+		}
+	}
+}
