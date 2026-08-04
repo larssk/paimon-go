@@ -237,26 +237,99 @@ for reader.Next() {
 }
 ```
 
+## Filtering rows
+
+Use `predicate.NewBuilder` to construct typed filter predicates. Predicates are applied at two
+levels automatically: stats-based file pruning (skips entire data files whose min/max/null-count
+statistics cannot satisfy the predicate) and row-level filtering inside the Parquet reader.
+
+```go
+import "github.com/larssk/paimon-go/predicate"
+
+pb := predicate.NewBuilder(tbl.Schema.Fields)
+
+// Single condition: status == "active"
+p, err := pb.Equal("status", "active")
+
+// Compound: status == "active" AND amount >= 100.0
+p2, err  := pb.GreaterOrEqual("amount", float64(100))
+filter   := predicate.And(p, p2)
+
+// IN list: category in ("books", "electronics")
+p3, err := pb.In("category", "books", "electronics")
+
+// NULL check
+p4, err := pb.IsNotNull("user_id")
+
+// Attach to ReadBuilder — affects both scan planning and row reads
+rb := read.NewReadBuilder(tbl).WithFilter(filter)
+plan, err   := rb.NewScan().Plan(ctx)
+reader, err := rb.NewRead().ToArrowReader(ctx, plan.Splits)
+```
+
+Available leaf operators: `Equal`, `NotEqual`, `LessThan`, `LessOrEqual`, `GreaterThan`,
+`GreaterOrEqual`, `IsNull`, `IsNotNull`, `In`.  
+Logical combinators: `predicate.And(...)`, `predicate.Or(...)`, `predicate.Not(p)`.
+
+---
+
 ## Example program
 
 A ready-to-run example that prints schema and rows to stdout is available at
-`examples/read_table/`:
+`examples/read_table/`.
+
+### Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--warehouse` | _(required)_ | Warehouse path — local filesystem or `gs://bucket/path` |
+| `--database` | `default` | Database name |
+| `--table` | _(required)_ | Table name |
+| `--limit` | `0` | Stop after N rows (0 = no limit) |
+| `--filter` | — | Equality filters: `field:value,...` — multiple pairs are AND'd together |
+| `--gcs-creds` | — | Path to GCS service-account JSON key file |
+| `--stream` | `false` | Continuous stream mode — polls for new snapshots indefinitely |
+| `--poll` | `2s` | Poll interval in stream mode (e.g. `5s`, `500ms`) |
+| `--from-earliest` | `false` | In stream mode, replay all existing snapshots before polling |
+
+### Examples
 
 ```sh
-# Local
+# Basic read (local)
 go run ./examples/read_table \
   --warehouse /path/to/warehouse \
-  --database mydb \
-  --table mytable \
+  --database mydb --table mytable \
   --limit 100
 
-# GCS
+# With a single equality filter
+go run ./examples/read_table \
+  --warehouse /path/to/warehouse \
+  --database mydb --table mytable \
+  --filter status:active
+
+# Multi-column filter (AND'd) on GCS
 go run ./examples/read_table \
   --warehouse gs://my-bucket/warehouse \
-  --database mydb \
-  --table mytable \
-  --gcs-creds /path/to/sa.json
+  --database mydb --table mytable \
+  --gcs-creds /path/to/sa.json \
+  --filter status:active,region:eu-west
+
+# Stream mode — emit only new snapshots as they arrive
+go run ./examples/read_table \
+  --warehouse gs://my-bucket/warehouse \
+  --database mydb --table mytable \
+  --stream --poll 5s
+
+# Stream mode — replay all existing history first, then keep polling
+go run ./examples/read_table \
+  --warehouse gs://my-bucket/warehouse \
+  --database mydb --table mytable \
+  --stream --from-earliest
 ```
+
+> The `--filter` flag supports type coercion for all Paimon atomic types (INT, BIGINT, FLOAT,
+> DOUBLE, BOOLEAN, DATE, TIMESTAMP, VARCHAR, etc.). DATE values use `YYYY-MM-DD`; TIMESTAMP
+> values use `YYYY-MM-DDTHH:MM:SS` or RFC3339.
 
 ## Module layout
 
