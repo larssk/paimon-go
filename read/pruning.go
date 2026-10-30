@@ -29,6 +29,7 @@ func pruneDataFiles(entries []manifest.ManifestEntry, filter *predicate.Predicat
 	partFilter := predicate.WithProjection(filter, partFields)
 	keyFields := storageKeyFields(s)
 	keyFilter := predicate.WithProjection(filter, keyFields)
+	buckets := newBucketPruner(s, filter)
 	valueFilter := filter
 	if s.IsPrimaryKeyTable() {
 		// A newer version (or tombstone) that fails a mutable-value predicate
@@ -54,6 +55,9 @@ func pruneDataFiles(entries []manifest.ManifestEntry, filter *predicate.Predicat
 		// Without a historical schema mapping, do not interpret old file stats
 		// using the latest schema's positions or types.
 		if e.File.SchemaID == s.ID {
+			if !buckets.mayContain(e.Bucket, e.TotalBuckets) {
+				continue
+			}
 			if s.IsPrimaryKeyTable() {
 				if !predicate.TestByKeyRange(keyFilter, e.File.KeyBounds(), keyFields) {
 					continue

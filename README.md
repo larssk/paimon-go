@@ -79,6 +79,9 @@ the same API as for append-only tables.
 - `PredicateBuilder` — builds typed predicates: `Equal`, `NotEqual`, `LessThan`, `LessOrEqual`, `GreaterThan`, `GreaterOrEqual`, `IsNull`, `IsNotNull`, `In`
 - Logical combinators: `And`, `Or`, `Not`
 - **Stats-based pruning** at both manifest-file level (partition stats) and data-file level (column value stats)
+- **Parquet row-group pruning** — footer statistics skip nonmatching groups before column data is fetched; deletion vectors retain original physical row positions
+- **Fixed-bucket pruning** — equality/`IN` predicates on every bucket-key field select only possible buckets using Java-compatible Paimon hashing and each entry's original bucket count
+- **Key-only pre-merge filtering** — nonmatching primary keys are discarded before entering the merge heap; mutable-value predicates remain after deduplication
 - Predicate index rebinding when used with column projection
 
 ### Output formats
@@ -191,8 +194,9 @@ Prioritised next steps, roughly in order:
 
 5. **ORC data files** — blocked on a pure-Go ORC reader with no CGO requirement.
 
-6. **Bucket and Parquet row-group pruning** — partition and key metadata pruning
-   are supported; bucket selection and predicate-based row-group skipping remain future work.
+6. **Advanced lookup pruning** — dynamic bucket indexes, custom bucket functions,
+   and page/Bloom-filter indexes remain future work; default fixed buckets and
+   Parquet row-group statistics are supported.
 
 7. **REST catalog** — implement `catalog.RESTCatalog` for managed / cloud-hosted
    Paimon deployments.
@@ -253,11 +257,30 @@ merging: doing so could remove a newer version or tombstone and expose an obsole
 Missing or incompatible statistics keep files conservatively, and partial `OR`/`NOT` predicates
 are never strengthened when rebinding to partition or key columns.
 
-These are pruned scans, **not indexed point lookups**: bucket pruning, global-index lookup,
-and predicate-based Parquet row-group skipping are not implemented. Reading a selected file
-to completion still reads every row group for the required columns. Random-access reads avoid
-whole-file buffering for local/GCS storage; custom non-seekable `FileIO` implementations retain
-the buffering fallback unless they implement `fileio.RandomAccessFileIO`.
+Fixed-bucket pruning supports the default Paimon bucket function with boolean, integer, date,
+and string keys. All bucket-key fields must have finite equality/`IN` constraints; expansion
+is capped at 1,000 key combinations. Dynamic buckets, custom functions, unsupported types,
+unknown bucket counts, and incompatible historical schemas fall back conservatively.
+
+Parquet footer statistics select matching row groups for flat, supported scalar columns.
+Missing statistics, nested columns, unsupported logical types (including decimal/timestamp
+bounds), floating-point bounds that cannot exclude NaNs, and incompatible schema representations
+keep groups conservatively. PK reads only
+use key predicates before merging; row filters still verify the final result.
+
+These are pruned scans, **not indexed point lookups**: global-index lookup, dynamic bucket
+indexes, and page/Bloom-filter skipping are not implemented. Random-access reads avoid
+whole-file downloads for local/GCS storage. Custom non-seekable `FileIO` implementations
+buffer at most a small file (1 MiB threshold) and spool larger files to temporary disk storage,
+which is deleted on release or read failure. They still download the whole selected file;
+implement `fileio.RandomAccessFileIO` to avoid that download. Temporary storage uses the
+standard OS temporary directory (`TMPDIR` on Linux).
+
+To benchmark a synthetic PK point lookup with and without row-group pruning:
+
+```sh
+go test ./read -run '^$' -bench BenchmarkPKPointLookupRowGroupPruning -benchmem
+```
 
 ```go
 import "github.com/larssk/paimon-go/predicate"

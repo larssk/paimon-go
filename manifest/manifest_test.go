@@ -39,3 +39,13 @@ func TestDataFileMeta_DecodesKeyBoundsSeparatelyFromStats(t *testing.T) {
 		t.Fatal("missing bounds should fall back to key-column envelope")
 	}
 }
+
+func TestManifestEntry_PreservesHistoricalBucketCount(t *testing.T) {
+	entry, err := manifestEntryFromRecord(map[string]interface{}{"_BUCKET": int32(3), "_TOTAL_BUCKETS": int32(16)}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Bucket != 3 || entry.TotalBuckets != 16 {
+		t.Fatalf("bucket metadata lost: %+v", entry)
+	}
+}

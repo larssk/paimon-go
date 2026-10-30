@@ -194,23 +194,53 @@ func (b *Builder) In(name string, values ...interface{}) (*Predicate, error) {
 
 // --- Stats-based file pruning ---
 
+// ColumnStats describes scalar bounds in the same logical representation used
+// by predicates. Nil bounds or NullCount mean unknown. It can describe a whole
+// file or a Parquet row group without converting statistics to BinaryRows.
+type ColumnStats struct {
+	Min, Max  interface{}
+	NullCount *int64
+	RowCount  int64
+}
+
 // TestByStats returns false if the predicate is guaranteed NOT to match any row
 // in a file with the given stats. Returns true if the file may contain matching rows.
 func TestByStats(p *Predicate, stats manifest.SimpleStats, rowCount int64) bool {
+	return TestByColumnStats(p, func(leaf *Predicate) ColumnStats {
+		idx := leaf.FieldIdx
+		result := ColumnStats{RowCount: rowCount}
+		if idx < 0 {
+			return result
+		}
+		if idx < len(stats.NullCounts) {
+			if n, ok := stats.NullCounts[idx].(int64); ok {
+				result.NullCount = &n
+			}
+		}
+		result.Min = getStatField(stats.MinValues, idx, leaf.TypeTag)
+		result.Max = getStatField(stats.MaxValues, idx, leaf.TypeTag)
+		return result
+	})
+}
+
+// TestByColumnStats conservatively evaluates a predicate using lazily supplied
+// column statistics. It returns false only when a match can be disproved.
+// The lookup must return unknown statistics for missing/unsupported columns.
+func TestByColumnStats(p *Predicate, lookup func(*Predicate) ColumnStats) bool {
 	if p == nil {
 		return true
 	}
 	switch p.Op {
 	case OpAnd:
 		for _, c := range p.Children {
-			if !TestByStats(c, stats, rowCount) {
+			if !TestByColumnStats(c, lookup) {
 				return false
 			}
 		}
 		return true
 	case OpOr:
 		for _, c := range p.Children {
-			if TestByStats(c, stats, rowCount) {
+			if TestByColumnStats(c, lookup) {
 				return true
 			}
 		}
@@ -220,19 +250,8 @@ func TestByStats(p *Predicate, stats manifest.SimpleStats, rowCount int64) bool 
 		return true
 	}
 
-	// Leaf predicate
-	idx := p.FieldIdx
-	if idx < 0 {
-		return true
-	}
-
-	// Null count check
-	var nullCount *int64
-	if stats.NullCounts != nil && idx < len(stats.NullCounts) {
-		if nc, ok := stats.NullCounts[idx].(int64); ok {
-			nullCount = &nc
-		}
-	}
+	stats := lookup(p)
+	nullCount, rowCount := stats.NullCount, stats.RowCount
 
 	if p.Op == OpIsNull {
 		return nullCount == nil || *nullCount > 0
@@ -241,9 +260,7 @@ func TestByStats(p *Predicate, stats manifest.SimpleStats, rowCount int64) bool 
 		return nullCount == nil || rowCount == 0 || *nullCount < rowCount
 	}
 
-	// Get min/max from BinaryRow stats
-	minVal := getStatField(stats.MinValues, idx, p.TypeTag)
-	maxVal := getStatField(stats.MaxValues, idx, p.TypeTag)
+	minVal, maxVal := stats.Min, stats.Max
 	if minVal == nil || maxVal == nil {
 		return true // no stats — keep file
 	}

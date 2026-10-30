@@ -448,20 +448,31 @@ func (r *sortMergeReader) openKVReader(fm manifest.DataFileMeta) (*fileKVReader,
 	fields = append(fields, r.keyFields...)
 	fields = append(fields, schema.DataField{Name: colSequenceNumber}, schema.DataField{Name: colValueKind})
 	fields = append(fields, r.evalFields...)
-	rdr, err := arrowReader.GetRecordReader(r.ctx, parquetColumnIndices(pqReader, fields), nil)
+	// Value predicates cannot remove updates or tombstones before merging.
+	rowFilter := predicate.WithProjection(r.filter, tbl.GetSchema().PrimaryKeyFields())
+	if fm.SchemaID != tbl.GetSchema().ID {
+		rowFilter = nil
+	}
+	rdr, err := newParquetRecordReader(r.ctx, pqReader, arrowReader, parquetColumnIndices(pqReader, fields), tbl.GetSchema().Fields, rowFilter)
 	if err != nil {
 		pqReader.Close()
 		return nil, fmt.Errorf("merge: record reader %s: %w", filePath, err)
 	}
-	return &fileKVReader{rdr: rdr, closer: pqReader, keyStats: fm.KeyStats}, nil
+	return &fileKVReader{
+		rdr: rdr, closer: pqReader, keyStats: fm.KeyStats,
+		keyFilter: rowFilter, keyFields: tbl.GetSchema().PrimaryKeyFields(),
+	}, nil
 }
 
 // ---- fileKVReader: reads one Parquet file, emitting heapEntry values ----
 
 type fileKVReader struct {
-	rdr      array.RecordReader
-	closer   io.Closer
-	keyStats manifest.SimpleStats
+	rdr         array.RecordReader
+	closer      io.Closer
+	keyStats    manifest.SimpleStats
+	keyFilter   *predicate.Predicate
+	keyFields   []schema.DataField
+	boundFilter *predicate.Predicate
 	// Current batch state.
 	batch    arrow.RecordBatch
 	batchRow int
@@ -490,6 +501,12 @@ func (f *fileKVReader) advance() (int64, binaryrow.RowKind, arrow.RecordBatch, i
 		if f.batch != nil && f.batchRow < int(f.batch.NumRows()) {
 			row := f.batchRow
 			f.batchRow++
+			// Every version of a primary key has the same key values, so this
+			// removes no update/tombstone needed by a matching key. In particular,
+			// never push a mutable value-column predicate into this path.
+			if !predicate.EvalRow(f.boundFilter, f.batch, row) {
+				continue
+			}
 			seq := f.readSeqNum(row)
 			kind := f.readKind(row)
 			return seq, kind, f.batch, row, true
@@ -508,6 +525,7 @@ func (f *fileKVReader) advance() (int64, binaryrow.RowKind, arrow.RecordBatch, i
 		f.batchRow = 0
 		// Resolve column indices once per batch (schema is constant across batches).
 		s := b.Schema()
+		f.boundFilter = keyFilterForRecord(f.keyFilter, f.keyFields, s)
 		f.seqCol = -1
 		f.kindCol = -1
 		for ci := 0; ci < s.NumFields(); ci++ {

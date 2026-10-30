@@ -42,7 +42,7 @@ func pkPhysicalArrowSchema() *arrow.Schema {
 // buildPKArrowTable builds a PK physical Parquet record with the given rows.
 // ids, seqs, kinds, vals must all have the same length.
 func buildPKArrowTable(
-	t *testing.T,
+	t testing.TB,
 	ids []int32,
 	seqs []int64,
 	kinds []int8,

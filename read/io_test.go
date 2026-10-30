@@ -18,6 +18,13 @@ type trackedFileIO struct {
 	opens, closes   map[string]int
 	bytesRead       int
 	sequentialReads int
+	ranges          []readRange
+}
+
+type readRange struct {
+	path   string
+	offset int64
+	length int
 }
 
 func newTrackedFileIO() *trackedFileIO {
@@ -48,6 +55,7 @@ func (f *trackedFile) Read(p []byte) (int, error) {
 func (f *trackedFile) ReadAt(p []byte, off int64) (int, error) {
 	n, err := f.Reader.ReadAt(p, off)
 	f.owner.bytesRead += n
+	f.owner.ranges = append(f.owner.ranges, readRange{path: f.path, offset: off, length: n})
 	return n, err
 }
 

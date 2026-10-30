@@ -189,7 +189,7 @@ type splitRecordReader struct {
 	currentErr error
 	fileRdr    *pqarrow.FileReader
 	rdrClose   io.Closer
-	rowRdr     array.RecordReader
+	rowRdr     *parquetRecordReader
 	evalFields []schema.DataField
 	evalSchema *arrow.Schema
 	evalFilter *predicate.Predicate
@@ -227,6 +227,7 @@ func (r *splitRecordReader) Next() bool {
 		if r.rowRdr != nil {
 			if r.rowRdr.Next() {
 				rec := r.rowRdr.RecordBatch()
+				r.fileRowOffset = r.rowRdr.RowOffset()
 				// Project to read schema (handles missing columns as nulls).
 				projected, err := projectRecord(r.ctx, rec, r.evalFields, r.evalSchema, r.alloc)
 				if err != nil {
@@ -352,7 +353,11 @@ func (r *splitRecordReader) openFile(split DataSplit, fm manifest.DataFileMeta) 
 		return fmt.Errorf("read: create arrow reader for %s: %w", filePath, err)
 	}
 
-	rowRdr, err := arrowReader.GetRecordReader(r.ctx, colIndices, nil)
+	rowFilter := r.tr.rb.filter
+	if fm.SchemaID != tbl.GetSchema().ID {
+		rowFilter = nil
+	}
+	rowRdr, err := newParquetRecordReader(r.ctx, pqReader, arrowReader, colIndices, tbl.GetSchema().Fields, rowFilter)
 	if err != nil {
 		pqReader.Close()
 		return fmt.Errorf("read: get record reader for %s: %w", filePath, err)

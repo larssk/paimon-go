@@ -87,7 +87,7 @@ func (r *readTable) DataFilePath(_ *binaryrow.BinaryRow, _ []schema.DataField, _
 // ---------------------------------------------------------------------------
 
 // writeParquet writes an arrow.Table to a Parquet file in memory and returns the bytes.
-func writeParquet(t *testing.T, tbl arrow.Table) []byte {
+func writeParquet(t testing.TB, tbl arrow.Table) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	writer, err := pqarrow.NewFileWriter(tbl.Schema(), &buf, nil, pqarrow.DefaultWriterProps())
@@ -105,7 +105,7 @@ func writeParquet(t *testing.T, tbl arrow.Table) []byte {
 
 // buildArrowTable builds a simple two-column (id INT32, val INT64) Arrow table
 // with the provided id and val slices.
-func buildArrowTable(t *testing.T, ids []int32, vals []int64) arrow.Table {
+func buildArrowTable(t testing.TB, ids []int32, vals []int64) arrow.Table {
 	t.Helper()
 	alloc := memory.NewGoAllocator()
 

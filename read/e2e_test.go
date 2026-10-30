@@ -406,5 +406,34 @@ func TestE2E_PK_PartitionAndKeyFilter(t *testing.T) {
 	}
 }
 
+func TestE2E_PK_FixedBucketPointLookups(t *testing.T) {
+	ctx := context.Background()
+	cat, err := paimon.NewCatalog(ctx, paimon.Options{Warehouse: fixtureWarehouse(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	tbl, err := cat.GetTable(ctx, "default", "pk_basic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id := int32(1); id <= 5; id++ {
+		p, _ := predicate.NewBuilder(tbl.Schema.Fields).Equal("id", id)
+		rb := read.NewReadBuilder(tbl).WithFilter(p)
+		plan, err := rb.NewScan().Plan(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := rb.NewRead().ToArrow(ctx, plan.Splits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.NumRows() != 1 {
+			t.Errorf("id=%d: want 1 row, got %d", id, result.NumRows())
+		}
+		result.Release()
+	}
+}
+
 // compile-time check: predicate.Builder is used above.
 var _ = (*predicate.Builder)(nil)

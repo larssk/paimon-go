@@ -75,6 +75,117 @@ func TestOpenRandomAccess_LegacyFallback(t *testing.T) {
 	}
 }
 
+func TestOpenRandomAccess_LargeLegacyFileSpoolsToDisk(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	data := bytes.Repeat([]byte("0123456789"), maxBufferedFileSize)
+	rc := &closeTracker{Reader: bytes.NewReader(data)}
+	r, err := OpenRandomAccess(context.Background(), &legacyFileIO{reader: rc}, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	f, ok := r.(*spooledFile)
+	if !ok {
+		t.Fatalf("large non-seekable file was buffered in memory: %T", r)
+	}
+	if !rc.closed {
+		t.Fatal("source stream was not closed")
+	}
+	name := f.Name()
+	buf := make([]byte, 10)
+	if n, err := r.ReadAt(buf, maxBufferedFileSize+3); err != nil || n != 10 || !bytes.Equal(buf, data[maxBufferedFileSize+3:maxBufferedFileSize+13]) {
+		t.Fatalf("spooled ReadAt: n=%d data=%q err=%v", n, buf, err)
+	}
+	if _, err := r.Seek(-10, io.SeekEnd); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := io.ReadFull(r, buf); err != nil || n != 10 || !bytes.Equal(buf, data[len(data)-10:]) {
+		t.Fatalf("spooled seek/read: n=%d data=%q err=%v", n, buf, err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(name); !os.IsNotExist(err) {
+		t.Fatalf("temporary file leaked: %v", err)
+	}
+}
+
+type failingStream struct {
+	remaining int
+	err       error
+}
+
+func (r *failingStream) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, r.err
+	}
+	n := min(len(p), r.remaining)
+	clear(p[:n])
+	r.remaining -= n
+	return n, nil
+}
+
+func TestOpenRandomAccess_SpoolFailureCleansUp(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	sentinel := errors.New("stream failed")
+	rc := &closeTracker{Reader: &failingStream{remaining: maxBufferedFileSize + 10000, err: sentinel}}
+	if _, err := OpenRandomAccess(context.Background(), &legacyFileIO{reader: rc}, "data"); !errors.Is(err, sentinel) {
+		t.Fatalf("stream error lost: %v", err)
+	}
+	if !rc.closed {
+		t.Fatal("failed source stream leaked")
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 0 {
+		t.Fatalf("temporary files leaked: %v (err=%v)", files, err)
+	}
+}
+
+func TestOpenRandomAccess_CanceledLegacyReadClosesSource(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rc := &closeTracker{Reader: bytes.NewReader([]byte("data"))}
+	if _, err := OpenRandomAccess(ctx, &legacyFileIO{reader: rc}, "data"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("context cancellation lost: %v", err)
+	}
+	if !rc.closed {
+		t.Fatal("canceled source stream leaked")
+	}
+}
+
+type cancelOnRead struct{ cancel context.CancelFunc }
+
+func (r cancelOnRead) Read(p []byte) (int, error) {
+	r.cancel()
+	p[0] = 0
+	return 1, nil
+}
+
+func TestOpenRandomAccess_CanceledSpoolCleansUp(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rc := &closeTracker{Reader: io.MultiReader(
+		bytes.NewReader(make([]byte, maxBufferedFileSize+1)),
+		cancelOnRead{cancel: cancel},
+	)}
+	if _, err := OpenRandomAccess(ctx, &legacyFileIO{reader: rc}, "data"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("spool cancellation lost: %v", err)
+	}
+	if !rc.closed {
+		t.Fatal("canceled spool source leaked")
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 0 {
+		t.Fatalf("canceled spool leaked files: %v (err=%v)", files, err)
+	}
+}
+
 func TestRangeReaderAt_BoundsAndConcurrentReads(t *testing.T) {
 	data := []byte("0123456789")
 	var mu sync.Mutex

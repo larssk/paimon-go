@@ -102,7 +102,10 @@ type ManifestEntry struct {
 	Kind      EntryKind
 	Partition *binaryrow.BinaryRow // decoded partition values (may be nil for unpartitioned)
 	Bucket    int
-	File      DataFileMeta
+	// TotalBuckets is the bucket count when this entry was written. Zero means
+	// unknown; it must not be replaced with the latest schema's bucket count.
+	TotalBuckets int
+	File         DataFileMeta
 }
 
 // --- Manifest List Reader ---
@@ -202,6 +205,7 @@ func manifestEntryFromRecord(rec map[string]interface{}, partFields, valueFields
 	kind, _ := toInt64(rec["_KIND"])
 	entry.Kind = EntryKind(kind)
 	entry.Bucket = int(mustInt64(rec["_BUCKET"]))
+	entry.TotalBuckets = int(mustInt64(rec["_TOTAL_BUCKETS"]))
 
 	if partRaw, ok := rec["_PARTITION"]; ok {
 		if partBytes, ok := partRaw.([]byte); ok && len(partBytes) > 0 {

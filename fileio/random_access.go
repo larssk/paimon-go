@@ -3,8 +3,11 @@ package fileio
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"os"
+	"sync"
 )
 
 // RandomAccessFile is a seekable data-file reader. ReadAt may be called
@@ -23,7 +26,8 @@ type RandomAccessFileIO interface {
 }
 
 // OpenRandomAccess prefers range reads or an already seekable Open result.
-// Only legacy, non-seekable backends fall back to buffering the entire file.
+// Legacy, non-seekable backends buffer small files and spool larger files to
+// temporary disk storage, bounding RAM usage while preserving compatibility.
 func OpenRandomAccess(ctx context.Context, fio FileIO, path string) (RandomAccessFile, error) {
 	if fio, ok := fio.(RandomAccessFileIO); ok {
 		return fio.OpenRandomAccess(ctx, path)
@@ -36,11 +40,63 @@ func OpenRandomAccess(ctx context.Context, fio FileIO, path string) (RandomAcces
 		return r, nil
 	}
 	defer rc.Close()
-	data, err := io.ReadAll(rc)
+	stream := &contextReader{ctx: ctx, reader: rc}
+	data, err := io.ReadAll(io.LimitReader(stream, maxBufferedFileSize+1))
 	if err != nil {
 		return nil, err
 	}
-	return &bufferedFile{Reader: bytes.NewReader(data)}, nil
+	if len(data) <= maxBufferedFileSize {
+		return &bufferedFile{Reader: bytes.NewReader(data)}, nil
+	}
+	f, err := os.CreateTemp("", "paimon-go-parquet-*")
+	if err != nil {
+		return nil, err
+	}
+	spooled := &spooledFile{File: f}
+	success := false
+	defer func() {
+		if !success {
+			spooled.Close()
+		}
+	}()
+	if _, err := f.Write(data); err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(f, stream); err != nil {
+		return nil, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	success = true
+	return spooled, nil
+}
+
+const maxBufferedFileSize = 1 << 20
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
+}
+
+type spooledFile struct {
+	*os.File
+	once     sync.Once
+	closeErr error
+}
+
+func (f *spooledFile) Close() error {
+	f.once.Do(func() {
+		f.closeErr = errors.Join(f.File.Close(), os.Remove(f.File.Name()))
+	})
+	return f.closeErr
 }
 
 type bufferedFile struct{ *bytes.Reader }
