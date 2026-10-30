@@ -7,7 +7,9 @@
 package predicate
 
 import (
+	"bytes"
 	"fmt"
+	"math"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -100,7 +102,7 @@ func Not(p *Predicate) *Predicate {
 type Builder struct {
 	fields []schema.DataField
 	// index map: field name → position in fields slice
-	index  map[string]int
+	index map[string]int
 }
 
 // NewBuilder creates a Builder bound to the given field slice.
@@ -220,6 +222,9 @@ func TestByStats(p *Predicate, stats manifest.SimpleStats, rowCount int64) bool 
 
 	// Leaf predicate
 	idx := p.FieldIdx
+	if idx < 0 {
+		return true
+	}
 
 	// Null count check
 	var nullCount *int64
@@ -294,12 +299,36 @@ func TestByStats(p *Predicate, stats manifest.SimpleStats, rowCount int64) bool 
 }
 
 func getStatField(row *binaryrow.BinaryRow, idx int, typeTag string) interface{} {
-	if row == nil || row.IsNull(idx) {
+	if row == nil || idx < 0 || idx >= row.Arity() || row.IsNull(idx) {
 		return nil
 	}
-	v, err := binaryrow.GetField(row, idx, typeTag)
+	var v interface{}
+	var err error
+	switch typeTag {
+	case "DATE":
+		// Predicates and Arrow DATE values use epoch days, not time.Time.
+		v, err = row.GetInt32(idx)
+	case "TIMESTAMP", "TIMESTAMP_LTZ":
+		// TypeTag does not carry timestamp precision, so the BinaryRow and
+		// Arrow units cannot be reconciled safely here. Keep the file.
+		return nil
+	case "BOOLEAN", "BOOL", "TINYINT", "BYTE", "SMALLINT", "SHORT", "INT", "INTEGER", "BIGINT", "LONG", "FLOAT", "REAL", "DOUBLE", "STRING", "VARCHAR", "CHAR", "BINARY", "VARBINARY", "BYTES":
+		v, err = binaryrow.GetField(row, idx, typeTag)
+	default:
+		return nil // never interpret unsupported statistics as strings
+	}
 	if err != nil {
 		return nil
+	}
+	switch v := v.(type) {
+	case float32:
+		if math.IsNaN(float64(v)) {
+			return nil
+		}
+	case float64:
+		if math.IsNaN(v) {
+			return nil
+		}
 	}
 	return v
 }
@@ -317,6 +346,18 @@ func compare(a, b interface{}) int {
 		return 1
 	}
 	switch av := a.(type) {
+	case bool:
+		bv, _ := b.(bool)
+		if av == bv {
+			return 0
+		}
+		if !av {
+			return -1
+		}
+		return 1
+	case []byte:
+		bv, _ := b.([]byte)
+		return bytes.Compare(av, bv)
 	case int8:
 		bv, _ := toComparableInt(b)
 		return compareInt64(int64(av), bv)
@@ -404,7 +445,9 @@ func toComparableFloat(v interface{}) (float64, bool) {
 }
 
 // WithProjection rebinds predicate leaf FieldIdx values to match a projected field slice.
-// Fields not present in the projected set are removed (predicate becomes nil for that leaf).
+// Missing fields are treated as unknown: AND may retain its known children, but
+// OR and NOT are discarded if removing a child could exclude matching rows.
+// A nil result means no restriction can safely be applied to this field set.
 func WithProjection(p *Predicate, projectedFields []schema.DataField) *Predicate {
 	if p == nil {
 		return nil
@@ -413,35 +456,131 @@ func WithProjection(p *Predicate, projectedFields []schema.DataField) *Predicate
 	for i, f := range projectedFields {
 		idx[f.Name] = i
 	}
-	return rebind(p, idx)
+	result, _ := rebind(p, idx)
+	return result
 }
 
-func rebind(p *Predicate, idx map[string]int) *Predicate {
+func rebind(p *Predicate, idx map[string]int) (*Predicate, bool) {
 	if p == nil {
-		return nil
+		return nil, false
 	}
 	switch p.Op {
 	case OpAnd, OpOr, OpNot:
 		children := make([]*Predicate, 0, len(p.Children))
+		complete := true
 		for _, c := range p.Children {
-			rc := rebind(c, idx)
+			rc, known := rebind(c, idx)
+			complete = complete && known
+			if p.Op == OpOr && rc == nil {
+				return nil, false
+			}
 			if rc != nil {
 				children = append(children, rc)
 			}
 		}
-		if len(children) == 0 {
-			return nil
+		if len(children) == 0 || (p.Op == OpNot && !complete) {
+			return nil, false
 		}
-		return &Predicate{Op: p.Op, Children: children}
+		return &Predicate{Op: p.Op, Children: children}, complete
 	default:
 		newIdx, ok := idx[p.FieldName]
 		if !ok {
-			return nil // field not in projected schema — drop this leaf
+			return nil, false
 		}
 		clone := *p
 		clone.FieldIdx = newIdx
-		return &clone
+		return &clone, true
 	}
+}
+
+// TestByKeyRange tests a lexicographic primary-key interval conservatively.
+// Unlike value statistics, key bounds are whole tuples, not independent column
+// minima/maxima. A suffix column is bounded only while all preceding columns
+// have identical endpoints. Missing or incompatible bounds keep the file.
+func TestByKeyRange(p *Predicate, stats manifest.SimpleStats, fields []schema.DataField) bool {
+	min, max := stats.MinValues, stats.MaxValues
+	if min == nil || max == nil || min.Arity() != len(fields) || max.Arity() != len(fields) {
+		return true
+	}
+	// A full-key equality is a point lookup candidate. Compare the entire
+	// tuple so boundary suffixes can prune even when the first key varies.
+	if point := equalityPoint(p, fields); point != nil {
+		compareBound := func(row *binaryrow.BinaryRow) (int, bool) {
+			for i, f := range fields {
+				v := getStatField(row, i, schema.TypeTag(f.Type))
+				if v == nil {
+					return 0, false
+				}
+				switch v.(type) {
+				case bool, int8, int16, int32, int64, float32, float64, string, []byte:
+				default:
+					return 0, false
+				}
+				if cmp := compare(point[i], v); cmp != 0 {
+					return cmp, true
+				}
+			}
+			return 0, true
+		}
+		if cmp, ok := compareBound(min); ok && cmp < 0 {
+			return false
+		}
+		if cmp, ok := compareBound(max); ok && cmp > 0 {
+			return false
+		}
+	}
+	bounded := 0
+	for i, f := range fields {
+		lo := getStatField(min, i, schema.TypeTag(f.Type))
+		hi := getStatField(max, i, schema.TypeTag(f.Type))
+		if lo == nil || hi == nil {
+			break
+		}
+		switch lo.(type) {
+		case bool, int8, int16, int32, int64, float32, float64, string, []byte:
+		default:
+			return true
+		}
+		bounded = i + 1
+		if compare(lo, hi) != 0 {
+			break
+		}
+	}
+	// Null counts in key metadata are not needed for range pruning.
+	stats.NullCounts = nil
+	return TestByStats(WithProjection(p, fields[:bounded]), stats, 0)
+}
+
+func equalityPoint(p *Predicate, fields []schema.DataField) []interface{} {
+	values := make(map[string]interface{})
+	var visit func(*Predicate)
+	visit = func(p *Predicate) {
+		if p == nil {
+			return
+		}
+		if p.Op == OpAnd {
+			for _, c := range p.Children {
+				visit(c)
+			}
+		} else if p.Op == OpEqual && len(p.Literals) == 1 {
+			values[p.FieldName] = p.Literals[0]
+		}
+	}
+	visit(p)
+	point := make([]interface{}, len(fields))
+	for i, f := range fields {
+		v, ok := values[f.Name]
+		if !ok || v == nil {
+			return nil
+		}
+		switch v.(type) {
+		case bool, int8, int16, int32, int64, float32, float64, string, []byte:
+		default:
+			return nil
+		}
+		point[i] = v
+	}
+	return point
 }
 
 // --- Row-level evaluation ---

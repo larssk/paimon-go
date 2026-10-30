@@ -188,16 +188,48 @@ func TestIntervalPartition_TwoNonOverlappingL1Files(t *testing.T) {
 	}
 }
 
-func TestIntervalPartition_L0FileInOwnSection(t *testing.T) {
+// TestIntervalPartition_OverlappingL0AndL1_SameSection verifies that an L0
+// file and an L1 file with overlapping key ranges land in the SAME section,
+// matching paimon-python's IntervalPartition (which does not special-case
+// level 0 at all — sections are formed purely from key-range overlap).
+//
+// This is required for correct merge-on-read: a DELETE row for a key in a
+// fresh L0 file must be merged against (and allowed to suppress) a stale
+// INSERT for the same key in an older L1 file. If L0 and L1 files were kept
+// in separate sections, the sort-merge heap would never compare their
+// entries, so the stale L1 row would survive unmerged and leak into read
+// output even though the key was deleted.
+func TestIntervalPartition_OverlappingL0AndL1_SameSection(t *testing.T) {
 	keyFields := []schema.DataField{{Name: "id", Type: schema.DataType{Type: "INT"}}}
 	files := []manifest.DataFileMeta{
 		{FileName: "l0.parquet", Level: 0, KeyStats: makeKeyStats(t, 1, 10)},
 		{FileName: "l1.parquet", Level: 1, KeyStats: makeKeyStats(t, 1, 10)},
 	}
 	sections := intervalPartition(files, keyFields)
-	// L1 goes into one section, L0 goes into another.
+	if len(sections) != 1 {
+		t.Fatalf("want 1 section (overlapping L0+L1 must merge together), got %d", len(sections))
+	}
+	total := 0
+	for _, run := range sections[0] {
+		total += len(run)
+	}
+	if total != 2 {
+		t.Errorf("want 2 files total in the merged section, got %d", total)
+	}
+}
+
+// TestIntervalPartition_NonOverlappingL0AndL1_SeparateSections verifies that
+// when key ranges genuinely do not overlap, files still form separate
+// sections regardless of level.
+func TestIntervalPartition_NonOverlappingL0AndL1_SeparateSections(t *testing.T) {
+	keyFields := []schema.DataField{{Name: "id", Type: schema.DataType{Type: "INT"}}}
+	files := []manifest.DataFileMeta{
+		{FileName: "l0.parquet", Level: 0, KeyStats: makeKeyStats(t, 1, 5)},
+		{FileName: "l1.parquet", Level: 1, KeyStats: makeKeyStats(t, 6, 10)},
+	}
+	sections := intervalPartition(files, keyFields)
 	if len(sections) != 2 {
-		t.Fatalf("want 2 sections (L1 section + L0 section), got %d", len(sections))
+		t.Fatalf("want 2 sections (non-overlapping ranges), got %d", len(sections))
 	}
 }
 
@@ -378,5 +410,65 @@ func TestPKMerge_UpdateBeforeDropped(t *testing.T) {
 	}
 	if vals[0] != 99 {
 		t.Errorf("want val=99, got %d", vals[0])
+	}
+}
+
+// TestPKMerge_DeleteInL0DropsStaleL1Insert reproduces the reported bug: a
+// stale INSERT for a key lives in an older, higher-level (L1) file while a
+// later DELETE for the SAME key lives in a fresh L0 file. Before the fix,
+// intervalPartition isolated L0 files into their own section, so the L0
+// DELETE and the L1 INSERT were never compared against each other by the
+// sort-merge heap — the L1 INSERT survived unmerged and leaked into read
+// output even though the key had been deleted.
+//
+// Correct behaviour (matching paimon-python): both files' key ranges overlap,
+// so they must land in the same section; the DELETE has the higher sequence
+// number and wins, and the merged result for this key must be empty.
+func TestPKMerge_DeleteInL0DropsStaleL1Insert(t *testing.T) {
+	// L1 file: stale INSERT for key=1, seqnum=1.
+	l1Tbl := buildPKArrowTable(t,
+		[]int32{1},
+		[]int64{1},
+		[]int8{0}, // INSERT
+		[]int64{1460},
+	)
+	defer l1Tbl.Release()
+	l1Bytes := writeParquet(t, l1Tbl)
+
+	// L0 file: later DELETE for the same key=1, higher seqnum=2.
+	l0Tbl := buildPKArrowTable(t,
+		[]int32{1},
+		[]int64{2},
+		[]int8{3}, // DELETE
+		[]int64{0},
+	)
+	defer l0Tbl.Release()
+	l0Bytes := writeParquet(t, l0Tbl)
+
+	mio := newMockFileIO()
+	mio.register("data/l1.parquet", l1Bytes)
+	mio.register("data/l0.parquet", l0Bytes)
+
+	sch := pkSchema()
+	rt := &readTable{sch: sch, io: mio}
+	rb := newReadBuilderFromIface(rt, nil)
+
+	split := makePKSplit(
+		manifest.DataFileMeta{FileName: "l1.parquet", Level: 1, RowCount: 1, KeyStats: makeKeyStats(t, 1, 1)},
+		manifest.DataFileMeta{FileName: "l0.parquet", Level: 0, RowCount: 1, KeyStats: makeKeyStats(t, 1, 1)},
+	)
+
+	rr, err := rb.NewRead().ToArrowReader(context.Background(), []DataSplit{split})
+	if err != nil {
+		t.Fatalf("ToArrowReader: %v", err)
+	}
+	defer rr.Release()
+
+	vals := collectInt64Col(t, rr, "val")
+	if err := rr.Err(); err != nil {
+		t.Fatalf("reader error: %v", err)
+	}
+	if len(vals) != 0 {
+		t.Errorf("want 0 rows (key deleted by L0 DELETE with higher seqnum), got %d rows with vals %v", len(vals), vals)
 	}
 }

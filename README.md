@@ -14,7 +14,7 @@ Supports both append-only and primary-key tables (deduplicate merge engine).
 | Backend | Notes |
 |---|---|
 | Local filesystem | `os.*` — always available |
-| Google Cloud Storage | via `cloud.google.com/go/storage`; ADC or explicit service-account key |
+| Google Cloud Storage | via `cloud.google.com/go/storage`; ADC or explicit service-account key; generation-pinned range reads for Parquet |
 
 ### Catalog
 
@@ -36,6 +36,7 @@ Supports both append-only and primary-key tables (deduplicate merge engine).
 - `TableRead.ToArrowReader()` — streams `arrow.RecordBatch` chunks (65 536 rows per batch)
 - `TableRead.ToArrow()` — convenience method returning a single `arrow.Table`
 - **Column projection** — only requested columns are read from Parquet
+- **Random-access data reads** — local files are read directly; GCS reads only requested byte ranges rather than buffering entire Parquet files
 - **Schema evolution / missing columns** — columns present in the schema but absent from a given Parquet file are returned as null arrays
 - **Type compatibility** — handles minor Arrow type mismatches between file physical type and schema type (e.g. `timestamp[us]` vs `timestamp[us, tz=UTC]`)
 
@@ -58,6 +59,8 @@ the same API as for append-only tables.
   only `INSERT` (kind=0) and `UPDATE_AFTER` (kind=2) rows are emitted
 - **Output schema** — internal PK columns (`_SEQUENCE_NUMBER`, `_VALUE_KIND`) are stripped;
   output contains only the user-visible value fields
+- **Lazy merge runs** — only the current file in each sorted run is open; exhausted files and early-stopped readers release their resources
+- **PK projection** — reads output columns, filter columns, primary keys, and merge metadata, rather than every column
 
 ### Streaming read
 
@@ -188,8 +191,8 @@ Prioritised next steps, roughly in order:
 
 5. **ORC data files** — blocked on a pure-Go ORC reader with no CGO requirement.
 
-6. **Partition filter pushdown on PK tables** — currently works for append-only;
-   PK-specific predicate pruning tests needed.
+6. **Bucket and Parquet row-group pruning** — partition and key metadata pruning
+   are supported; bucket selection and predicate-based row-group skipping remain future work.
 
 7. **REST catalog** — implement `catalog.RESTCatalog` for managed / cloud-hosted
    Paimon deployments.
@@ -240,8 +243,21 @@ for reader.Next() {
 ## Filtering rows
 
 Use `predicate.NewBuilder` to construct typed filter predicates. Predicates are applied at two
-levels automatically: stats-based file pruning (skips entire data files whose min/max/null-count
-statistics cannot satisfy the predicate) and row-level filtering inside the Parquet reader.
+levels automatically: metadata-based file pruning before data files are opened, and row-level
+filtering after Parquet decoding (after deduplication for primary-key tables).
+
+Planning checks manifest partition statistics, exact entry partitions, and data-file statistics.
+For primary-key tables it also uses lexicographic `_MIN_KEY`/`_MAX_KEY` bounds and independent
+key-column statistics. Mutable value-column predicates are not used to discard PK files before
+merging: doing so could remove a newer version or tombstone and expose an obsolete row.
+Missing or incompatible statistics keep files conservatively, and partial `OR`/`NOT` predicates
+are never strengthened when rebinding to partition or key columns.
+
+These are pruned scans, **not indexed point lookups**: bucket pruning, global-index lookup,
+and predicate-based Parquet row-group skipping are not implemented. Reading a selected file
+to completion still reads every row group for the required columns. Random-access reads avoid
+whole-file buffering for local/GCS storage; custom non-seekable `FileIO` implementations retain
+the buffering fallback unless they implement `fileio.RandomAccessFileIO`.
 
 ```go
 import "github.com/larssk/paimon-go/predicate"

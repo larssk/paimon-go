@@ -192,32 +192,11 @@ func (ts *TableScan) Plan(ctx context.Context) (*Plan, error) {
 }
 
 func (ts *TableScan) pruneManifestFiles(metas []manifest.ManifestFileMeta) []manifest.ManifestFileMeta {
-	if ts.rb.filter == nil {
-		return metas
-	}
-	result := metas[:0]
-	for _, m := range metas {
-		totalFiles := m.NumAddedFiles + m.NumDeletedFiles
-		if predicate.TestByStats(ts.rb.filter, m.PartitionStats, totalFiles) {
-			result = append(result, m)
-		}
-	}
-	return result
+	return pruneManifests(metas, ts.rb.filter, ts.rb.tbl.GetSchema())
 }
 
 func (ts *TableScan) pruneEntries(entries []manifest.ManifestEntry) []manifest.ManifestEntry {
-	if ts.rb.filter == nil {
-		return entries
-	}
-	result := entries[:0]
-	for _, e := range entries {
-		// Rebind predicate to value field indices for this file's stats.
-		p := predicate.WithProjection(ts.rb.filter, ts.rb.tbl.GetSchema().Fields)
-		if predicate.TestByStats(p, e.File.ValueStats, e.File.RowCount) {
-			result = append(result, e)
-		}
-	}
-	return result
+	return pruneDataFiles(entries, ts.rb.filter, ts.rb.tbl.GetSchema())
 }
 
 func (ts *TableScan) buildSplits(entries []manifest.ManifestEntry) []DataSplit {

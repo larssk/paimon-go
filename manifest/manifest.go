@@ -64,6 +64,10 @@ type DataFileMeta struct {
 	// of rows in this file. Used by the PK merge pipeline to pick the latest row.
 	MinSequenceNumber int64
 	MaxSequenceNumber int64
+	// MinKey and MaxKey are the lexicographic first/last primary-key tuples.
+	// These differ from KeyStats, which contains independent column statistics.
+	MinKey *binaryrow.BinaryRow
+	MaxKey *binaryrow.BinaryRow
 	// KeyStats holds min/max/null statistics for the primary key columns.
 	KeyStats SimpleStats
 	// ValueStats holds min/max/null statistics for all value columns.
@@ -81,6 +85,16 @@ type DataFileMeta struct {
 	// ValueStatsCols lists the column names for which ValueStats are tracked.
 	// Nil means all columns are tracked.
 	ValueStatsCols []string
+}
+
+// KeyBounds returns lexicographic key bounds for merge planning and pruning.
+// Older/custom metadata without explicit bounds falls back to the conservative
+// envelope described by independent key-column minima/maxima.
+func (f DataFileMeta) KeyBounds() SimpleStats {
+	if f.MinKey != nil && f.MaxKey != nil {
+		return SimpleStats{MinValues: f.MinKey, MaxValues: f.MaxKey}
+	}
+	return SimpleStats{MinValues: f.KeyStats.MinValues, MaxValues: f.KeyStats.MaxValues}
 }
 
 // ManifestEntry is a single record from a manifest file.
@@ -223,6 +237,12 @@ func dataFileMetaFromMap(m map[string]interface{}, valueFields []schema.DataFiel
 	fm.MaxSequenceNumber, _ = toInt64(m["_MAX_SEQUENCE_NUMBER"])
 	fm.DeleteRowCount = optInt64(m["_DELETE_ROW_COUNT"])
 	fm.FirstRowID = optInt64(m["_FIRST_ROW_ID"])
+	if data, ok := m["_MIN_KEY"].([]byte); ok && len(data) > 0 {
+		fm.MinKey, _ = binaryrow.New(data)
+	}
+	if data, ok := m["_MAX_KEY"].([]byte); ok && len(data) > 0 {
+		fm.MaxKey, _ = binaryrow.New(data)
+	}
 	if ep, ok := m["_EXTERNAL_PATH"]; ok {
 		if s, ok := ep.(string); ok && s != "" {
 			fm.ExternalPath = &s

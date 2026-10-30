@@ -236,17 +236,7 @@ func (ts *TableStream) readDelta(ctx context.Context, snap *snapshot.Snapshot) (
 		return nil, fmt.Errorf("stream: delta manifest list for snapshot %d: %w", snap.ID, err)
 	}
 
-	// Prune manifest files by partition stats if a filter is set.
-	if ts.sb.filter != nil {
-		pruned := deltaMetas[:0]
-		for _, m := range deltaMetas {
-			total := m.NumAddedFiles + m.NumDeletedFiles
-			if predicate.TestByStats(ts.sb.filter, m.PartitionStats, total) {
-				pruned = append(pruned, m)
-			}
-		}
-		deltaMetas = pruned
-	}
+	deltaMetas = pruneManifests(deltaMetas, ts.sb.filter, s)
 
 	entries, err := mr.ReadAllEntries(ctx, deltaMetas, partFields, valueFields)
 	if err != nil {
@@ -262,17 +252,7 @@ func (ts *TableStream) readDelta(ctx context.Context, snap *snapshot.Snapshot) (
 		}
 	}
 
-	// Prune individual files by value stats if a filter is set.
-	if ts.sb.filter != nil {
-		pruned := addEntries[:0]
-		for _, e := range addEntries {
-			p := predicate.WithProjection(ts.sb.filter, s.Fields)
-			if predicate.TestByStats(p, e.File.ValueStats, e.File.RowCount) {
-				pruned = append(pruned, e)
-			}
-		}
-		addEntries = pruned
-	}
+	addEntries = pruneDataFiles(addEntries, ts.sb.filter, s)
 
 	splits := buildStreamSplits(addEntries)
 	return &StreamBatch{Splits: splits, SnapshotID: snap.ID}, nil
@@ -343,7 +323,7 @@ func (r *TableStreamReader) Schema() *arrow.Schema {
 }
 
 // Retain is a no-op; TableStreamReader does not use reference counting.
-func (r *TableStreamReader) Retain()  {}
+func (r *TableStreamReader) Retain() {}
 
 // Release releases the current record batch and any open inner reader.
 // Safe to call multiple times. Call when you are done with the reader.

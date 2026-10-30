@@ -353,6 +353,9 @@ func TestE2E_PK_PartitionFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
+	if len(plan.Splits) != 1 {
+		t.Fatalf("partition filter must prune before reading: want 1 split, got %d", len(plan.Splits))
+	}
 
 	rdr, err := rb.NewRead().ToArrowReader(ctx, plan.Splits)
 	if err != nil {
@@ -369,6 +372,37 @@ func TestE2E_PK_PartitionFilter(t *testing.T) {
 	}
 	if total != 2 {
 		t.Errorf("partition filter dt='2024-01-02': want 2 rows, got %d", total)
+	}
+}
+
+func TestE2E_PK_PartitionAndKeyFilter(t *testing.T) {
+	ctx := context.Background()
+	cat, err := paimon.NewCatalog(ctx, paimon.Options{Warehouse: fixtureWarehouse(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	tbl, err := cat.GetTable(ctx, "default", "pk_partitioned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pb := predicate.NewBuilder(tbl.Schema.Fields)
+	id, _ := pb.Equal("id", int32(1))
+	dt, _ := pb.Equal("dt", "2024-01-01")
+	for _, p := range []*predicate.Predicate{id, predicate.And(id, dt)} {
+		rb := read.NewReadBuilder(tbl).WithFilter(p)
+		plan, err := rb.NewScan().Plan(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := rb.NewRead().ToArrow(ctx, plan.Splits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.NumRows() != 1 {
+			t.Errorf("want current id=1 row, got %d rows", result.NumRows())
+		}
+		result.Release()
 	}
 }
 

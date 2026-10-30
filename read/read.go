@@ -15,13 +15,13 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 
+	"github.com/larssk/paimon-go/fileio"
 	"github.com/larssk/paimon-go/internal/binaryrow"
 	"github.com/larssk/paimon-go/internal/deletionvector"
 	"github.com/larssk/paimon-go/manifest"
 	"github.com/larssk/paimon-go/predicate"
 	"github.com/larssk/paimon-go/schema"
 )
-
 
 // TableRead executes the read of splits and produces Arrow data.
 type TableRead struct {
@@ -190,15 +190,18 @@ type splitRecordReader struct {
 	fileRdr    *pqarrow.FileReader
 	rdrClose   io.Closer
 	rowRdr     array.RecordReader
+	evalFields []schema.DataField
+	evalSchema *arrow.Schema
+	evalFilter *predicate.Predicate
 
 	// Deletion vector state — reset per file in openFile.
-	dvBitmap     *roaring.Bitmap // nil if no DV for this file
-	fileRowOffset int64          // absolute row position of the start of the current batch
+	dvBitmap      *roaring.Bitmap // nil if no DV for this file
+	fileRowOffset int64           // absolute row position of the start of the current batch
 }
 
 func (r *splitRecordReader) Schema() *arrow.Schema { return r.arrowSchema }
 
-func (r *splitRecordReader) Retain()  {}
+func (r *splitRecordReader) Retain() {}
 func (r *splitRecordReader) Release() {
 	if r.current != nil {
 		r.current.Release()
@@ -225,7 +228,7 @@ func (r *splitRecordReader) Next() bool {
 			if r.rowRdr.Next() {
 				rec := r.rowRdr.RecordBatch()
 				// Project to read schema (handles missing columns as nulls).
-				projected, err := r.projectRecord(r.ctx, rec)
+				projected, err := projectRecord(r.ctx, rec, r.evalFields, r.evalSchema, r.alloc)
 				if err != nil {
 					r.currentErr = err
 					return false
@@ -245,15 +248,26 @@ func (r *splitRecordReader) Next() bool {
 
 				// Row-level filter: discard non-matching rows.
 				if r.tr.rb.filter != nil {
-					filtered := filterBatch(r.tr.rb.filter, projected, r.alloc)
+					filtered := filterBatch(r.evalFilter, projected, r.alloc)
 					projected.Release()
 					if filtered == nil {
 						continue // all rows filtered out; advance to next batch
 					}
 					projected = filtered
 				}
-				r.current = projected
+				output, err := r.projectRecord(r.ctx, projected)
+				projected.Release()
+				if err != nil {
+					r.currentErr = err
+					return false
+				}
+				r.current = output
 				return true
+			}
+			if err := r.rowRdr.Err(); err != nil {
+				r.currentErr = err
+				r.closeCurrentFile()
+				return false
 			}
 			r.closeCurrentFile()
 		}
@@ -280,6 +294,22 @@ func (r *splitRecordReader) Next() bool {
 
 func (r *splitRecordReader) openFile(split DataSplit, fm manifest.DataFileMeta) error {
 	tbl := r.tr.rb.tbl
+	r.evalFields = append([]schema.DataField(nil), r.readFields...)
+	names := make(map[string]bool)
+	for _, f := range r.evalFields {
+		names[f.Name] = true
+	}
+	for _, f := range filterFields(r.tr.rb.filter, tbl.GetSchema().Fields) {
+		if !names[f.Name] {
+			r.evalFields = append(r.evalFields, f)
+		}
+	}
+	var err error
+	r.evalSchema, err = schema.ToArrowSchema(r.evalFields)
+	if err != nil {
+		return err
+	}
+	r.evalFilter = predicate.WithProjection(r.tr.rb.filter, r.evalFields)
 	var filePath string
 	if fm.ExternalPath != nil {
 		filePath = *fm.ExternalPath
@@ -300,20 +330,12 @@ func (r *splitRecordReader) openFile(split DataSplit, fm manifest.DataFileMeta) 
 		return fmt.Errorf("read: unsupported file format for %q (only parquet supported in v1)", filePath)
 	}
 
-	rc, err := tbl.GetIO().Open(r.ctx, filePath)
+	rc, err := fileio.OpenRandomAccess(r.ctx, tbl.GetIO(), filePath)
 	if err != nil {
 		return fmt.Errorf("read: open %s: %w", filePath, err)
 	}
 
-	// pqarrow requires a parquet.ReaderAtSeeker. Wrap the ReadCloser.
-	ras, err := toReaderAtSeeker(rc)
-	if err != nil {
-		rc.Close()
-		return fmt.Errorf("read: wrap reader for %s: %w", filePath, err)
-	}
-	r.rdrClose = rc
-
-	pqReader, err := file.NewParquetReader(ras)
+	pqReader, err := file.NewParquetReader(rc)
 	if err != nil {
 		rc.Close()
 		return fmt.Errorf("read: open parquet %s: %w", filePath, err)
@@ -326,18 +348,19 @@ func (r *splitRecordReader) openFile(split DataSplit, fm manifest.DataFileMeta) 
 		BatchSize: 65536,
 	}, r.alloc)
 	if err != nil {
-		rc.Close()
+		pqReader.Close()
 		return fmt.Errorf("read: create arrow reader for %s: %w", filePath, err)
 	}
 
 	rowRdr, err := arrowReader.GetRecordReader(r.ctx, colIndices, nil)
 	if err != nil {
-		rc.Close()
+		pqReader.Close()
 		return fmt.Errorf("read: get record reader for %s: %w", filePath, err)
 	}
 
 	r.fileRdr = arrowReader
 	r.rowRdr = rowRdr
+	r.rdrClose = pqReader
 	r.dvBitmap = nil
 	r.fileRowOffset = 0
 
@@ -368,17 +391,23 @@ func (r *splitRecordReader) openFile(split DataSplit, fm manifest.DataFileMeta) 
 }
 
 // parquetColumnIndices maps the read fields to Parquet column indices.
-// Fields not present in the file are included as -1 (handled in projectRecord).
+// Missing fields are omitted here and filled with nulls in projectRecord.
 func (r *splitRecordReader) parquetColumnIndices(pqReader *file.Reader) []int {
+	fields := append([]schema.DataField(nil), r.readFields...)
+	fields = append(fields, filterFields(r.tr.rb.filter, r.tr.rb.tbl.GetSchema().Fields)...)
+	return parquetColumnIndices(pqReader, fields)
+}
+
+func parquetColumnIndices(pqReader *file.Reader, fields []schema.DataField) []int {
 	parquetSchema := pqReader.MetaData().Schema
-	nameToCol := make(map[string]int, parquetSchema.NumColumns())
-	for i := 0; i < parquetSchema.NumColumns(); i++ {
-		nameToCol[parquetSchema.Column(i).Name()] = i
+	names := make(map[string]bool, len(fields))
+	for _, f := range fields {
+		names[f.Name] = true
 	}
-	indices := make([]int, 0, len(r.readFields))
-	for _, f := range r.readFields {
-		if ci, ok := nameToCol[f.Name]; ok {
-			indices = append(indices, ci)
+	indices := make([]int, 0, len(fields))
+	for i := 0; i < parquetSchema.NumColumns(); i++ {
+		if names[parquetSchema.Column(i).ColumnPath()[0]] {
+			indices = append(indices, i)
 		}
 	}
 	return indices
@@ -391,19 +420,23 @@ func (r *splitRecordReader) parquetColumnIndices(pqReader *file.Reader) []int {
 // vs without timezone), the column data is reused and the schema field is overridden
 // to match what the file actually contains, avoiding Arrow type-mismatch panics.
 func (r *splitRecordReader) projectRecord(ctx context.Context, rec arrow.RecordBatch) (arrow.RecordBatch, error) {
-	if rec.Schema().Equal(r.arrowSchema) {
+	return projectRecord(ctx, rec, r.readFields, r.arrowSchema, r.alloc)
+}
+
+func projectRecord(ctx context.Context, rec arrow.RecordBatch, fields []schema.DataField, arrowSchema *arrow.Schema, alloc memory.Allocator) (arrow.RecordBatch, error) {
+	if rec.Schema().Equal(arrowSchema) {
 		rec.Retain()
 		return rec, nil
 	}
 
 	fileSchema := rec.Schema()
-	cols := make([]arrow.Array, len(r.readFields))
+	cols := make([]arrow.Array, len(fields))
 	// Build the effective schema: use the file's field type when it differs from
 	// the read schema but is physically compatible (same base type + unit).
-	effectiveFields := make([]arrow.Field, len(r.readFields))
+	effectiveFields := make([]arrow.Field, len(fields))
 	n := rec.NumRows()
 
-	for i, f := range r.readFields {
+	for i, f := range fields {
 		wantField, err := schema.ToArrowField(f)
 		if err != nil {
 			return nil, err
@@ -438,7 +471,7 @@ func (r *splitRecordReader) projectRecord(ctx context.Context, rec arrow.RecordB
 			}
 		} else {
 			// Field missing from file: synthesize a null array.
-			nullArr := array.MakeArrayOfNull(r.alloc, wantField.Type, int(n))
+			nullArr := array.MakeArrayOfNull(alloc, wantField.Type, int(n))
 			cols[i] = nullArr
 			effectiveFields[i] = wantField
 		}
@@ -493,61 +526,6 @@ func isParquet(name string) bool {
 		strings.HasSuffix(lower, ".lz4.parquet") ||
 		// Paimon sometimes uses just ".parquet" or "-{uuid}.parquet"
 		strings.Contains(lower, ".parquet")
-}
-
-// toReaderAtSeeker wraps an io.ReadCloser into a parquet ReaderAtSeeker by reading all bytes.
-// For streaming GCS / local files we buffer into memory; for large files a seekable wrapper
-// would be preferable, but this keeps the implementation simple for v1.
-type memReaderAt struct {
-	data []byte
-	pos  int64
-}
-
-func toReaderAtSeeker(rc io.ReadCloser) (*memReaderAt, error) {
-	data, err := io.ReadAll(rc)
-	if err != nil {
-		return nil, err
-	}
-	return &memReaderAt{data: data}, nil
-}
-
-func (m *memReaderAt) ReadAt(p []byte, off int64) (int, error) {
-	if off >= int64(len(m.data)) {
-		return 0, io.EOF
-	}
-	n := copy(p, m.data[off:])
-	if n < len(p) {
-		return n, io.EOF
-	}
-	return n, nil
-}
-
-func (m *memReaderAt) Read(p []byte) (int, error) {
-	if m.pos >= int64(len(m.data)) {
-		return 0, io.EOF
-	}
-	n := copy(p, m.data[m.pos:])
-	m.pos += int64(n)
-	return n, nil
-}
-
-func (m *memReaderAt) Seek(offset int64, whence int) (int64, error) {
-	var abs int64
-	switch whence {
-	case io.SeekStart:
-		abs = offset
-	case io.SeekCurrent:
-		abs = m.pos + offset
-	case io.SeekEnd:
-		abs = int64(len(m.data)) + offset
-	default:
-		return 0, fmt.Errorf("memReaderAt: invalid whence %d", whence)
-	}
-	if abs < 0 {
-		return 0, fmt.Errorf("memReaderAt: negative seek")
-	}
-	m.pos = abs
-	return abs, nil
 }
 
 // applyDeletionVector filters a record batch by removing rows whose absolute

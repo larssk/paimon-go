@@ -212,6 +212,7 @@ func TestPlan_BuildsSplits(t *testing.T) {
 // whose stats prove the predicate cannot match are NOT passed to ReadAllEntries.
 func TestPlan_PrunesManifestFilesByPartitionStats(t *testing.T) {
 	sch := intSchema()
+	sch.PartitionKeys = []string{"id"}
 	tbl := &stubTable{snap: makeSnap(1), sch: sch}
 
 	// meta1: id in [100, 200] — will NOT satisfy id == 5 → should be pruned.

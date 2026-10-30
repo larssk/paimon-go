@@ -24,6 +24,7 @@ import (
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 
+	"github.com/larssk/paimon-go/fileio"
 	"github.com/larssk/paimon-go/internal/binaryrow"
 	"github.com/larssk/paimon-go/manifest"
 	"github.com/larssk/paimon-go/predicate"
@@ -50,76 +51,70 @@ type kvRow struct {
 
 // intervalPartition groups files into non-overlapping sections.
 // Each section is a slice of SortedRuns; within each section, all runs have
-// non-overlapping key ranges (guaranteed for L1+ files).
-// L0 files have overlapping ranges and are each placed in their own SortedRun
-// within a single shared section (so they all get merged together).
+// non-overlapping key ranges.
+//
+// This mirrors paimon-python's IntervalPartition.partition() (interval_partition.py):
+// ALL files — regardless of level — are sorted together by (minKey, maxKey)
+// and partitioned into sections purely by key-range overlap. There is no
+// special-casing for level 0: L0 files typically have wide, overlapping key
+// ranges and therefore naturally end up sharing a section with any L1+ files
+// whose ranges overlap, which is required for correct merge-on-read — e.g. a
+// DELETE row in a fresh L0 file must be able to merge against (and suppress)
+// a stale INSERT row for the same key in an older L1+ file. Isolating L0
+// into its own section (as an earlier version of this function did) breaks
+// that merge and lets stale rows leak through undeleted.
 //
 // Returns: []section where section = []sortedRun = []DataFileMeta
 func intervalPartition(files []manifest.DataFileMeta, keyFields []schema.DataField) [][][]manifest.DataFileMeta {
 	if len(files) == 0 {
 		return nil
 	}
-
-	// Separate L0 (overlapping) from higher-level (sorted) files.
-	var l0 []manifest.DataFileMeta
-	var lN []manifest.DataFileMeta
 	for _, f := range files {
-		if f.Level == 0 {
-			l0 = append(l0, f)
-		} else {
-			lN = append(lN, f)
+		bounds := f.KeyBounds()
+		if bounds.MinValues == nil || bounds.MaxValues == nil || bounds.MinValues.Arity() != len(keyFields) || bounds.MaxValues.Arity() != len(keyFields) {
+			// An unknown range may overlap every other file. Keep all files in
+			// one section, with a separate run per file, rather than accidentally
+			// separating versions of a key and exposing stale rows.
+			runs := make([][]manifest.DataFileMeta, len(files))
+			for i, file := range files {
+				runs[i] = []manifest.DataFileMeta{file}
+			}
+			return [][][]manifest.DataFileMeta{runs}
 		}
 	}
 
-	// Sort lN files by their min key.
-	sort.Slice(lN, func(i, j int) bool {
-		return binaryrow.Compare(lN[i].KeyStats.MinValues, lN[j].KeyStats.MinValues, keyFields) < 0
+	sorted := make([]manifest.DataFileMeta, len(files))
+	copy(sorted, files)
+
+	// Sort by (minKey, maxKey) ascending — matches paimon-python's _compare_files.
+	sort.Slice(sorted, func(i, j int) bool {
+		cmp := binaryrow.Compare(sorted[i].KeyBounds().MinValues, sorted[j].KeyBounds().MinValues, keyFields)
+		if cmp != 0 {
+			return cmp < 0
+		}
+		return binaryrow.Compare(sorted[i].KeyBounds().MaxValues, sorted[j].KeyBounds().MaxValues, keyFields) < 0
 	})
 
-	// Build sections from lN files using the greedy interval-partition algorithm
-	// (same as paimon-python IntervalPartition._partition_section).
-	// A section boundary occurs whenever a file's minKey > current section bound.
+	// Build sections using the greedy interval-partition algorithm (same as
+	// paimon-python IntervalPartition.partition()). A section boundary occurs
+	// whenever a file's minKey > current section bound.
 	var sections [][][]manifest.DataFileMeta
+	var currentSection []manifest.DataFileMeta
+	var sectionBound *binaryrow.BinaryRow
 
-	if len(lN) > 0 {
-		// Each section is a list of SortedRuns.
-		// A SortedRun is a list of files that are guaranteed non-overlapping.
-		// We use a heap of "runs" ordered by the max key of their last file.
-		var currentSection []manifest.DataFileMeta
-		sectionBound := lN[0].KeyStats.MaxValues // max key seen in current section
-
-		for _, f := range lN {
-			cmp := binaryrow.Compare(f.KeyStats.MinValues, sectionBound, keyFields)
-			if cmp > 0 {
-				// New section: flush current section.
-				if len(currentSection) > 0 {
-					secs := partitionSection(currentSection, keyFields)
-					sections = append(sections, secs)
-				}
-				currentSection = nil
-				sectionBound = f.KeyStats.MaxValues
-			} else {
-				// Extend section bound if this file's max is larger.
-				if binaryrow.Compare(f.KeyStats.MaxValues, sectionBound, keyFields) > 0 {
-					sectionBound = f.KeyStats.MaxValues
-				}
-			}
-			currentSection = append(currentSection, f)
+	for _, f := range sorted {
+		if len(currentSection) > 0 && binaryrow.Compare(f.KeyBounds().MinValues, sectionBound, keyFields) > 0 {
+			sections = append(sections, partitionSection(currentSection, keyFields))
+			currentSection = nil
+			sectionBound = nil
 		}
-		if len(currentSection) > 0 {
-			secs := partitionSection(currentSection, keyFields)
-			sections = append(sections, secs)
+		currentSection = append(currentSection, f)
+		if sectionBound == nil || binaryrow.Compare(f.KeyBounds().MaxValues, sectionBound, keyFields) > 0 {
+			sectionBound = f.KeyBounds().MaxValues
 		}
 	}
-
-	// L0 files: each goes into its own SortedRun inside one shared section.
-	// (They overlap, so they all need to be merged together in one section.)
-	if len(l0) > 0 {
-		l0Section := make([][]manifest.DataFileMeta, len(l0))
-		for i, f := range l0 {
-			l0Section[i] = []manifest.DataFileMeta{f}
-		}
-		sections = append(sections, l0Section)
+	if len(currentSection) > 0 {
+		sections = append(sections, partitionSection(currentSection, keyFields))
 	}
 
 	return sections
@@ -127,8 +122,8 @@ func intervalPartition(files []manifest.DataFileMeta, keyFields []schema.DataFie
 
 // heapRun tracks the current max-key boundary for a run being built.
 type heapRun struct {
-	files    []manifest.DataFileMeta
-	maxKey   *binaryrow.BinaryRow
+	files     []manifest.DataFileMeta
+	maxKey    *binaryrow.BinaryRow
 	keyFields []schema.DataField
 }
 
@@ -160,7 +155,7 @@ func partitionSection(files []manifest.DataFileMeta, keyFields []schema.DataFiel
 		if h.Len() > 0 {
 			top := (*h)[0]
 			// Can this file extend the top run without overlapping?
-			if binaryrow.Compare(f.KeyStats.MinValues, top.maxKey, keyFields) > 0 {
+			if binaryrow.Compare(f.KeyBounds().MinValues, top.maxKey, keyFields) > 0 {
 				run = heap.Pop(h).(*heapRun)
 			}
 		}
@@ -168,7 +163,7 @@ func partitionSection(files []manifest.DataFileMeta, keyFields []schema.DataFiel
 			run = &heapRun{keyFields: keyFields}
 		}
 		run.files = append(run.files, f)
-		run.maxKey = f.KeyStats.MaxValues
+		run.maxKey = f.KeyBounds().MaxValues
 		heap.Push(h, run)
 	}
 
@@ -193,10 +188,13 @@ type sortMergeReader struct {
 	arrowSchema *arrow.Schema
 	alloc       memory.Allocator
 	filter      *predicate.Predicate // nil = no filter
+	evalFields  []schema.DataField
+	evalSchema  *arrow.Schema
+	evalFilter  *predicate.Predicate
 
 	// State machine: sections → per-section heap merge
-	sections     [][][]manifest.DataFileMeta // from intervalPartition
-	sectionIdx   int
+	sections   [][][]manifest.DataFileMeta // from intervalPartition
+	sectionIdx int
 
 	// Current section's heap-merge state
 	merger *sectionMerger
@@ -226,7 +224,12 @@ func newSortMergeReader(
 	filter *predicate.Predicate,
 ) (*sortMergeReader, error) {
 	s := tbl.GetSchema()
-	sections := intervalPartition(split.Files, s.PrimaryKeyFields())
+	sections := intervalPartition(split.Files, storageKeyFields(s))
+	evalFields := filterFields(filter, s.Fields)
+	evalSchema, err := schema.ToArrowSchema(evalFields)
+	if err != nil {
+		return nil, err
+	}
 	return &sortMergeReader{
 		ctx:         ctx,
 		tbl:         tbl,
@@ -237,6 +240,9 @@ func newSortMergeReader(
 		alloc:       alloc,
 		sections:    sections,
 		filter:      filter,
+		evalFields:  evalFields,
+		evalSchema:  evalSchema,
+		evalFilter:  predicate.WithProjection(filter, evalFields),
 	}, nil
 }
 
@@ -251,6 +257,11 @@ func (r *sortMergeReader) Release() {
 		r.merger.close()
 		r.merger = nil
 	}
+	for _, row := range r.pending[r.pendIdx:] {
+		row.batch.Release()
+	}
+	r.pending = nil
+	r.pendIdx = 0
 }
 func (r *sortMergeReader) RecordBatch() arrow.RecordBatch { return r.current }
 func (r *sortMergeReader) Record() arrow.RecordBatch      { return r.current }
@@ -304,7 +315,10 @@ func (r *sortMergeReader) Next() bool {
 			return false
 		}
 		if len(rows) == 0 {
-			// Section exhausted.
+			// A deleted key produces no row, but does not exhaust the section.
+			if !r.merger.done() {
+				continue
+			}
 			r.merger.close()
 			r.merger = nil
 			continue
@@ -321,6 +335,19 @@ func (r *sortMergeReader) buildOutputRecord(mr mergedRow) (arrow.RecordBatch, er
 	defer rec.Release() // release the retained batch now that we've extracted the row
 	rowIdx := mr.rowIdx
 	fileSchema := rec.Schema()
+	if r.filter != nil {
+		row := rec.NewSlice(int64(rowIdx), int64(rowIdx+1))
+		eval, err := projectRecord(r.ctx, row, r.evalFields, r.evalSchema, r.alloc)
+		row.Release()
+		if err != nil {
+			return nil, err
+		}
+		matches := predicate.EvalRow(r.evalFilter, eval, 0)
+		eval.Release()
+		if !matches {
+			return nil, nil
+		}
+	}
 
 	cols := make([]arrow.Array, len(r.readFields))
 	effectiveFields := make([]arrow.Field, len(r.readFields))
@@ -358,11 +385,6 @@ func (r *sortMergeReader) buildOutputRecord(mr mergedRow) (arrow.RecordBatch, er
 
 	effectiveSchema := arrow.NewSchema(effectiveFields, nil)
 	out := array.NewRecord(effectiveSchema, cols, 1)
-	// Apply row-level filter against the output record.
-	if r.filter != nil && !predicate.EvalRow(r.filter, out, 0) {
-		out.Release()
-		return nil, nil
-	}
 	return out, nil
 }
 
@@ -379,23 +401,12 @@ func (r *sortMergeReader) openSection(section [][]manifest.DataFileMeta) (*secti
 		}
 		runs = append(runs, rr)
 	}
-	return newSectionMerger(runs, r.keyFields), nil
+	return newSectionMerger(runs, r.keyFields)
 }
 
-// newRunReader opens all files in a SortedRun and returns a runReader.
+// newRunReader defers file opens until the run advances to each file.
 func (r *sortMergeReader) newRunReader(files []manifest.DataFileMeta) (*runReader, error) {
-	readers := make([]*fileKVReader, 0, len(files))
-	for _, fm := range files {
-		fr, err := r.openKVReader(fm)
-		if err != nil {
-			for _, existing := range readers {
-				existing.close()
-			}
-			return nil, err
-		}
-		readers = append(readers, fr)
-	}
-	return &runReader{readers: readers}, nil
+	return &runReader{files: files, open: r.openKVReader}, nil
 }
 
 // openKVReader opens one Parquet file and returns a fileKVReader.
@@ -417,39 +428,39 @@ func (r *sortMergeReader) openKVReader(fm manifest.DataFileMeta) (*fileKVReader,
 		)
 	}
 
-	rc, err := tbl.GetIO().Open(r.ctx, filePath)
+	rc, err := fileio.OpenRandomAccess(r.ctx, tbl.GetIO(), filePath)
 	if err != nil {
 		return nil, fmt.Errorf("merge: open %s: %w", filePath, err)
 	}
-	ras, err := toReaderAtSeeker(rc)
+	pqReader, err := file.NewParquetReader(rc)
 	if err != nil {
 		rc.Close()
-		return nil, fmt.Errorf("merge: buffer %s: %w", filePath, err)
-	}
-	rc.Close() // data is now in memory
-
-	pqReader, err := file.NewParquetReader(ras)
-	if err != nil {
 		return nil, fmt.Errorf("merge: open parquet %s: %w", filePath, err)
 	}
 	arrowReader, err := pqarrow.NewFileReader(pqReader, pqarrow.ArrowReadProperties{
 		BatchSize: 65536,
 	}, r.alloc)
 	if err != nil {
+		pqReader.Close()
 		return nil, fmt.Errorf("merge: arrow reader %s: %w", filePath, err)
 	}
-	// Read all columns (we need _SEQUENCE_NUMBER, _VALUE_KIND plus all value cols).
-	rdr, err := arrowReader.GetRecordReader(r.ctx, nil, nil)
+	fields := append([]schema.DataField(nil), r.readFields...)
+	fields = append(fields, r.keyFields...)
+	fields = append(fields, schema.DataField{Name: colSequenceNumber}, schema.DataField{Name: colValueKind})
+	fields = append(fields, r.evalFields...)
+	rdr, err := arrowReader.GetRecordReader(r.ctx, parquetColumnIndices(pqReader, fields), nil)
 	if err != nil {
+		pqReader.Close()
 		return nil, fmt.Errorf("merge: record reader %s: %w", filePath, err)
 	}
-	return &fileKVReader{rdr: rdr, keyStats: fm.KeyStats}, nil
+	return &fileKVReader{rdr: rdr, closer: pqReader, keyStats: fm.KeyStats}, nil
 }
 
 // ---- fileKVReader: reads one Parquet file, emitting heapEntry values ----
 
 type fileKVReader struct {
 	rdr      array.RecordReader
+	closer   io.Closer
 	keyStats manifest.SimpleStats
 	// Current batch state.
 	batch    arrow.RecordBatch
@@ -466,6 +477,10 @@ func (f *fileKVReader) close() {
 	if f.rdr != nil {
 		f.rdr.Release()
 		f.rdr = nil
+	}
+	if f.closer != nil {
+		f.closer.Close()
+		f.closer = nil
 	}
 }
 
@@ -537,23 +552,37 @@ func (f *fileKVReader) readKind(row int) binaryrow.RowKind {
 // ---- runReader: concatenates fileKVReaders for one SortedRun ----
 
 type runReader struct {
-	readers []*fileKVReader
+	files   []manifest.DataFileMeta
+	open    func(manifest.DataFileMeta) (*fileKVReader, error)
+	current *fileKVReader
 	idx     int
+	err     error
 }
 
 func (r *runReader) close() {
-	for _, fr := range r.readers {
-		fr.close()
+	if r.current != nil {
+		r.current.close()
+		r.current = nil
 	}
+	r.idx = len(r.files)
 }
 
 // next returns the next row from the run (across all files in order).
 func (r *runReader) next() (int64, binaryrow.RowKind, arrow.RecordBatch, int, bool) {
-	for r.idx < len(r.readers) {
-		seq, kind, batch, row, ok := r.readers[r.idx].advance()
+	for r.idx < len(r.files) && r.err == nil {
+		if r.current == nil {
+			r.current, r.err = r.open(r.files[r.idx])
+			if r.err != nil {
+				return 0, 0, nil, 0, false
+			}
+		}
+		seq, kind, batch, row, ok := r.current.advance()
 		if ok {
 			return seq, kind, batch, row, true
 		}
+		r.err = r.current.rdr.Err()
+		r.current.close()
+		r.current = nil
 		r.idx++
 	}
 	return 0, 0, nil, 0, false
@@ -787,20 +816,25 @@ func pkColIndices(batchSchema *arrow.Schema, keyFields []schema.DataField) []int
 
 type sectionMerger struct {
 	h         *mergeHeap
+	runs      []*runReader
 	keyFields []schema.DataField
 	exhausted bool
 }
 
-func newSectionMerger(runs []*runReader, keyFields []schema.DataField) *sectionMerger {
+func newSectionMerger(runs []*runReader, keyFields []schema.DataField) (*sectionMerger, error) {
 	h := &mergeHeap{}
 	heap.Init(h)
-	m := &sectionMerger{h: h, keyFields: keyFields}
+	m := &sectionMerger{h: h, runs: runs, keyFields: keyFields}
 
 	// Seed the heap with the first row from each run.
 	for _, run := range runs {
 		run := run // capture
 		seq, kind, batch, row, ok := run.next()
 		if !ok {
+			if run.err != nil {
+				m.close()
+				return nil, run.err
+			}
 			continue
 		}
 		batch.Retain() // heapEntry owns a reference
@@ -818,13 +852,19 @@ func newSectionMerger(runs []*runReader, keyFields []schema.DataField) *sectionM
 		}
 		heap.Push(h, entry)
 	}
-	return m
+	return m, nil
 }
 
 func (m *sectionMerger) done() bool { return m.exhausted }
 
 func (m *sectionMerger) close() {
-	// runs are closed by sortMergeReader
+	for m.h.Len() > 0 {
+		heap.Pop(m.h).(*heapEntry).batch.Release()
+	}
+	for _, run := range m.runs {
+		run.close()
+	}
+	m.exhausted = true
 }
 
 // next pops all entries with the same minimum key, runs DeduplicateMergeFunction,
@@ -848,6 +888,13 @@ func (m *sectionMerger) next() ([]mergedRow, error) {
 
 		// Advance the run and push the next row back.
 		seq, kind, batch, row, ok := e.run.next()
+		if e.run.err != nil {
+			for _, entry := range group {
+				entry.batch.Release()
+			}
+			m.close()
+			return nil, e.run.err
+		}
 		if ok {
 			batch.Retain() // next heapEntry owns a reference
 			colIdx := pkColIndices(batch.Schema(), m.keyFields)
@@ -877,7 +924,7 @@ func (m *sectionMerger) next() ([]mergedRow, error) {
 
 	// Drop DELETE (3) and UPDATE_BEFORE (1).
 	if winner.kind == binaryrow.Delete || winner.kind == binaryrow.UpdateBefore {
-		winner.batch.Release() // release the winner too since we won't use it
+		winner.batch.Release()    // release the winner too since we won't use it
 		return []mergedRow{}, nil // empty = "no output for this key"
 	}
 
@@ -991,6 +1038,3 @@ func extractRow(src arrow.Array, i int, alloc memory.Allocator) arrow.Array {
 		return array.MakeArrayOfNull(alloc, src.DataType(), 1)
 	}
 }
-
-// Ensure io is imported (used via toReaderAtSeeker which takes io.ReadCloser).
-var _ io.Reader
