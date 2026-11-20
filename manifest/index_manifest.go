@@ -1,11 +1,8 @@
 package manifest
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-
-	"github.com/hamba/avro/v2/ocf"
 
 	"github.com/larssk/paimon-go/fileio"
 	"github.com/larssk/paimon-go/internal/binaryrow"
@@ -67,19 +64,9 @@ func ReadDeletionVectors(
 		return nil, fmt.Errorf("index manifest: read %s: %w", indexManifestName, err)
 	}
 
-	dec, err := ocf.NewDecoder(bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("index manifest: parse avro %s: %w", indexManifestName, err)
-	}
-
 	result := make(map[string]DeletionVectorMeta)
 
-	for dec.HasNext() {
-		var rec map[string]interface{}
-		if err := dec.Decode(&rec); err != nil {
-			return nil, fmt.Errorf("index manifest: decode record: %w", err)
-		}
-
+	err = forEachRecord(data, "index manifest", func(rec map[string]interface{}) error {
 		// Parse partition.
 		var partition *binaryrow.BinaryRow
 		if raw, ok := rec["_PARTITION"]; ok && raw != nil {
@@ -98,18 +85,18 @@ func ReadDeletionVectors(
 
 		key := partBucket{part: partitionHex(partition), bucket: bucket}
 		if _, ok := relevant[key]; !ok {
-			continue
+			return nil
 		}
 
 		// Parse index file metadata.
 		indexType, _ := rec["_INDEX_TYPE"].(string)
 		if indexType != indexTypeDV {
-			continue
+			return nil
 		}
 
 		fileName, _ := rec["_FILE_NAME"].(string)
 		if fileName == "" {
-			continue
+			return nil
 		}
 
 		indexFilePath := pathutil.Join(manifestDir, "..", "index", fileName)
@@ -139,9 +126,11 @@ func ReadDeletionVectors(
 				Cardinality:   cardinality,
 			}
 		}
-	}
-	if err := dec.Error(); err != nil {
-		return nil, fmt.Errorf("index manifest: %w", err)
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return result, nil
 }

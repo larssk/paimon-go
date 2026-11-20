@@ -5,10 +5,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"sync"
 
-	"github.com/hamba/avro/v2"
-	"github.com/hamba/avro/v2/ocf"
+	"github.com/twmb/avro/ocf"
 
 	"github.com/larssk/paimon-go/fileio"
 	"github.com/larssk/paimon-go/internal/binaryrow"
@@ -104,28 +104,41 @@ func ReadManifestList(ctx context.Context, fio fileio.FileIO, manifestDir, filen
 }
 
 func parseManifestList(data []byte, partFields []schema.DataField) ([]ManifestFileMeta, error) {
-	dec, err := ocf.NewDecoder(bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("manifest list: open avro: %w", err)
-	}
-
 	var results []ManifestFileMeta
-	for dec.HasNext() {
-		var rec map[string]interface{}
-		if err := dec.Decode(&rec); err != nil {
-			return nil, fmt.Errorf("manifest list: read record: %w", err)
-		}
+	err := forEachRecord(data, "manifest list", func(rec map[string]interface{}) error {
 		meta, err := manifestFileMetaFromRecord(rec, partFields)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		results = append(results, meta)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	if err := dec.Error(); err != nil {
-		return nil, fmt.Errorf("manifest list: avro error: %w", err)
-	}
-	_ = avro.Config{} // ensure import used
 	return results, nil
+}
+
+// forEachRecord decodes every record of an Avro object container file into a
+// generic map and calls fn for each one. what is used as an error prefix.
+func forEachRecord(data []byte, what string, fn func(rec map[string]interface{}) error) error {
+	r, err := ocf.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("%s: open avro: %w", what, err)
+	}
+	defer r.Close()
+	for {
+		var rec map[string]interface{}
+		if err := r.Decode(&rec); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("%s: read record: %w", what, err)
+		}
+		if err := fn(rec); err != nil {
+			return err
+		}
+	}
 }
 
 func manifestFileMetaFromRecord(rec map[string]interface{}, partFields []schema.DataField) (ManifestFileMeta, error) {
@@ -159,25 +172,17 @@ func ReadManifestEntries(ctx context.Context, fio fileio.FileIO, manifestDir, fi
 }
 
 func parseManifestEntries(data []byte, partFields, valueFields []schema.DataField) ([]ManifestEntry, error) {
-	dec, err := ocf.NewDecoder(bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("manifest entry: open avro: %w", err)
-	}
-
 	var entries []ManifestEntry
-	for dec.HasNext() {
-		var rec map[string]interface{}
-		if err := dec.Decode(&rec); err != nil {
-			return nil, fmt.Errorf("manifest entry: read record: %w", err)
-		}
+	err := forEachRecord(data, "manifest entry", func(rec map[string]interface{}) error {
 		entry, err := manifestEntryFromRecord(rec, partFields, valueFields)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		entries = append(entries, entry)
-	}
-	if err := dec.Error(); err != nil {
-		return nil, fmt.Errorf("manifest entry: avro error: %w", err)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return entries, nil
 }
